@@ -11,4 +11,3 @@ RUN apk add git clang cmake && \
 FROM alpine as electrs
 RUN apk add gcc libstdc++
 COPY --from=electrs_builder /app/target/release/electrs /bin
-# CMD sh -c "electrs -vv --timestamp --jsonrpc-import --network=liquidregtest --cookie=elements:elements --daemon-rpc-addr=172.32.0.3:7040 --http-addr=0.0.0.0:3002"
