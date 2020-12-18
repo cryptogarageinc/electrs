@@ -29,6 +29,14 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.CR_PAT }}
 
+      - name: Get short SHA
+        id: short-sha
+        run: echo "::set-output name=sha8::$(echo ${GITHUB_SHA} | cut -c1-8)"
+
+      - name: Get tagname
+        id: tagname
+        run: echo ::set-output name=tagname::${GITHUB_REF/refs\/tags\//}
+
       - name: Build and push
         uses: docker/build-push-action@v2
         with:
@@ -36,4 +44,4 @@ jobs:
           push: true
           tags: |
             ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:latest
-            ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ env.TAG }}-${{ env.SHA8 }}
+            ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ steps.tagname.outputs.tagname }}-${{ steps.short-sha.outputs.sha8 }}
