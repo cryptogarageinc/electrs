@@ -38,6 +38,6 @@ jobs:
           context: .
           push: true
           repository: ${{ github.repository }}
-          tags:
-            - ${{ github.repository }}:latest
-            - ${{ github.repository }}:${{ steps.tagname.outputs.tagname }}-${{ steps.short-sha.outputs.sha8 }}
+          tags: |
+            ${{ github.repository }}:latest
+            ${{ github.repository }}:${{ steps.tagname.outputs.tagname }}-${{ steps.short-sha.outputs.sha8 }}
