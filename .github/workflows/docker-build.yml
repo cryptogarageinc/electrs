@@ -4,7 +4,6 @@ on:
   push:
     branches:
       - master
-      - feature/add-dockerfile # 動作確認用
     tags:
       - 'v*'
 
