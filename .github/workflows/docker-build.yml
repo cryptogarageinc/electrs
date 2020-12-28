@@ -3,14 +3,14 @@ name: Build and Publish to Docker Hub
 on:
   push:
     branches:
-      - new-index
-      - feature/add-dockerfile
+      - master
+      - feature/add-dockerfile # 動作確認用
     tags:
-      - '*'
+      - 'v*'
 
 jobs:
   build_and_push:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-18.04
     steps:
       - name: checkout
         uses: actions/checkout@v2
@@ -42,3 +42,11 @@ jobs:
           tags: |
             ${{ github.repository }}:latest
             ${{ github.repository }}:${{ steps.tagname.outputs.tagname }}-${{ steps.short-sha.outputs.sha8 }}
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ github.repository }}:${{ steps.tagname.outputs.tagname }}-${{ steps.short-sha.outputs.sha8 }}
+          format: table
+          exit-code: 1
+          severity: CRITICAL,HIGH
