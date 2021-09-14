@@ -287,7 +287,7 @@ impl Connection {
 
         Ok(json!({
             "confirmed": chain_stats.funded_txo_sum - chain_stats.spent_txo_sum,
-            "unconfirmed": mempool_stats.funded_txo_sum - mempool_stats.spent_txo_sum,
+            "unconfirmed": mempool_stats.funded_txo_sum as i64 - mempool_stats.spent_txo_sum as i64,
         }))
     }
 
