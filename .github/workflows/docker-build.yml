@@ -7,7 +7,7 @@ on:
 
 jobs:
   build_and_push_elements_image:
-    runs-on: ubuntu-18.04
+    runs-on: ubuntu-20.04
     steps:
       - name: checkout
         uses: actions/checkout@v2
@@ -20,10 +20,6 @@ jobs:
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Get short SHA
-        id: short-sha
-        run: echo "::set-output name=sha8::$(echo ${GITHUB_SHA} | cut -c1-8)"
 
       - name: Get nearest tagname
         id: tagname
@@ -36,18 +32,18 @@ jobs:
           push: true
           tags: |
             ${{ github.repository }}:latest
-            ${{ github.repository }}:${{ steps.tagname.outputs.tagname }}-${{ steps.short-sha.outputs.sha8 }}
+            ${{ github.repository }}:${{ steps.tagname.outputs.tagname }}
 
       - name: Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@master
         with:
-          image-ref: ${{ github.repository }}:${{ steps.tagname.outputs.tagname }}-${{ steps.short-sha.outputs.sha8 }}
+          image-ref: ${{ github.repository }}:${{ steps.tagname.outputs.tagname }}
           format: table
           exit-code: 1
           severity: CRITICAL,HIGH
 
   build_and_push_bitcoin_image:
-    runs-on: ubuntu-18.04
+    runs-on: ubuntu-20.04
     steps:
       - name: checkout
         uses: actions/checkout@v2
@@ -61,10 +57,6 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Get short SHA
-        id: short-sha
-        run: echo "::set-output name=sha8::$(echo ${GITHUB_SHA} | cut -c1-8)"
-
       - name: Get nearest tagname
         id: tagname
         run: echo ::set-output name=tagname::${GITHUB_REF/refs\/tags\//}
@@ -76,12 +68,12 @@ jobs:
           file: ./Dockerfile_bitcoin
           push: true
           tags: |
-            ${{ github.repository }}:${{ steps.tagname.outputs.tagname }}-${{ steps.short-sha.outputs.sha8 }}-bitcoin
+            ${{ github.repository }}:${{ steps.tagname.outputs.tagname }}-bitcoin
 
       - name: Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@master
         with:
-          image-ref: ${{ github.repository }}:${{ steps.tagname.outputs.tagname }}-${{ steps.short-sha.outputs.sha8 }}-bitcoin
+          image-ref: ${{ github.repository }}:${{ steps.tagname.outputs.tagname }}-bitcoin
           format: table
           exit-code: 1
           severity: CRITICAL,HIGH
