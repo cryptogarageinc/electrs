@@ -38,6 +38,7 @@ pub struct Config {
     pub ignore_warn_feeinfo: bool,
     pub address_search: bool,
     pub index_unspendables: bool,
+    pub ignore_check_initialblockdownload: bool,
     pub cors: Option<String>,
     pub precache_scripts: Option<String>,
     pub utxos_limit: usize,
@@ -176,6 +177,11 @@ impl Config {
                 Arg::with_name("index_unspendables")
                     .long("index-unspendables")
                     .help("Enable indexing of provably unspendable outputs")
+            )
+            .arg(
+                Arg::with_name("ignore_check_initialblockdownload")
+                    .long("ignore-check-initialblockdownload")
+                    .help("Enable ignore checking initialblockdownload")
             )
             .arg(
                 Arg::with_name("cors")
@@ -433,6 +439,7 @@ impl Config {
             ignore_warn_feeinfo: m.is_present("ignore_warn_feeinfo"),
             address_search: m.is_present("address_search"),
             index_unspendables: m.is_present("index_unspendables"),
+            ignore_check_initialblockdownload: m.is_present("ignore_check_initialblockdownload"),
             cors: m.value_of("cors").map(|s| s.to_string()),
             precache_scripts: m.value_of("precache_scripts").map(|s| s.to_string()),
 
@@ -451,7 +458,7 @@ impl Config {
 
         let mut dump_info: Config = config.clone();
         if m.is_present("config_mask_password") {
-            dump_info.cookie = Some("********".to_string());   // for bitcoin rpc account & password
+            dump_info.cookie = Some("********".to_string()); // for bitcoin rpc account & password
         }
         if m.is_present("config_log_info") {
             info!("{:?}", dump_info)

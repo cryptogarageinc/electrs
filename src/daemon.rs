@@ -279,6 +279,7 @@ impl Daemon {
         network: Network,
         signal: Waiter,
         metrics: &Metrics,
+        ignore_check_initialblockdownload: bool,
     ) -> Result<Daemon> {
         let daemon = Daemon {
             daemon_dir: daemon_dir.clone(),
@@ -316,7 +317,10 @@ impl Daemon {
         loop {
             let info = daemon.getblockchaininfo()?;
 
-            if !info.initialblockdownload.unwrap_or(false) && info.blocks == info.headers {
+            if info.blocks == info.headers
+                && (ignore_check_initialblockdownload
+                    || !info.initialblockdownload.unwrap_or(false))
+            {
                 break;
             }
 

@@ -1,11 +1,11 @@
+use chrono::{SecondsFormat, Utc};
 use log::{Level, Log, Metadata, Record, SetLoggerError};
 use std::default::Default;
-use std::io::{self, Stdout};
 use std::fmt;
-use chrono::{Utc, SecondsFormat};
 use std::io::Write;
+use std::io::{self, Stdout};
 
-#[derive(Serialize,Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct JsonLogObj {
     timestamp: String,
     status: String,
@@ -13,7 +13,7 @@ struct JsonLogObj {
     caller: String,
 }
 
-#[derive(Debug,Clone)]
+#[derive(Debug, Clone)]
 pub struct JsonLogger {
     level: Level,
 }
@@ -35,7 +35,7 @@ impl JsonLogger {
     }
 
     pub fn init(&mut self) -> Result<(), SetLoggerError> {
-        let logger = StdOutJsonLogger{
+        let logger = StdOutJsonLogger {
             out: io::stdout(),
             level: self.level,
         };
@@ -49,12 +49,12 @@ impl fmt::Display for JsonLogger {
         write!(f, "JsonLogger{{\"level\":\"{}\"}}", &self.level)
     }
 }
-  
+
 impl Default for JsonLogger {
     fn default() -> JsonLogger {
         JsonLogger {
             level: Level::Error,
-       }
+        }
     }
 }
 
@@ -70,7 +70,7 @@ impl Log for StdOutJsonLogger {
 
     fn log(&self, record: &Record) {
         if !self.enabled(&record.metadata()) {
-            return
+            return;
         }
         let line: u32 = match record.line() {
             Some(line) => line,
@@ -80,7 +80,7 @@ impl Log for StdOutJsonLogger {
             Some(file) => format!("{}:{}", file, line),
             _ => String::default(),
         };
-        let obj = JsonLogObj{
+        let obj = JsonLogObj {
             timestamp: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
             status: std::format!("{}", record.level()),
             msg: record.args().to_string(),

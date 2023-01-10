@@ -52,6 +52,7 @@ fn run_server(config: Arc<Config>) -> Result<()> {
         config.network_type,
         signal.clone(),
         &metrics,
+        config.ignore_check_initialblockdownload,
     )?);
     let store = Arc::new(Store::open(&config.db_path.join("newindex"), &config));
     let mut indexer = Indexer::open(

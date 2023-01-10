@@ -37,6 +37,7 @@ fn main() {
             config.network_type,
             signal,
             &metrics,
+            config.ignore_check_initialblockdownload,
         )
         .unwrap(),
     );
