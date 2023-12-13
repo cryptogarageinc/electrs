@@ -247,8 +247,11 @@ impl Indexer {
     }
 
     fn get_new_headers(&self, daemon: &Daemon, tip: &BlockHash) -> Result<Vec<HeaderEntry>> {
+        trace!("get_new_headers: read start indexed header on DB");
         let headers = self.store.indexed_headers.read().unwrap();
+        trace!("get_new_headers: read finish indexed header on DB, len={:?}", headers.len());
         let new_headers = daemon.get_new_headers(&headers, &tip)?;
+        trace!("get_new_headers: get new headers, len={:?}", new_headers.len());
         let result = headers.order(new_headers);
 
         if let Some(tip) = result.last() {
@@ -258,9 +261,13 @@ impl Indexer {
     }
 
     pub fn update(&mut self, daemon: &Daemon) -> Result<BlockHash> {
+        trace!("schema update: start");
         let daemon = daemon.reconnect()?;
+        trace!("schema update: reconnected");
         let tip = daemon.getbestblockhash()?;
+        trace!("schema update: called getbestblockhash");
         let new_headers = self.get_new_headers(&daemon, &tip)?;
+        trace!("schema update: called get_new_headers");
 
         let to_add = self.headers_to_add(&new_headers);
         debug!(
