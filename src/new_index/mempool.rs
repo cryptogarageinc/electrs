@@ -17,8 +17,8 @@ use crate::daemon::Daemon;
 use crate::errors::*;
 use crate::metrics::{GaugeVec, HistogramOpts, HistogramVec, MetricOpts, Metrics};
 use crate::new_index::{
-    compute_script_hash, schema::FullHash, ChainQuery, FundingInfo, ScriptStats, SpendingInfo,
-    SpendingInput, TxHistoryInfo, Utxo,
+    compute_script_hash, schema::FullHash, ChainQuery, FundingInfo, GetAmountVal, ScriptStats,
+    SpendingInfo, SpendingInput, TxHistoryInfo, Utxo,
 };
 use crate::util::fees::{make_fee_histogram, TxFeeInfo};
 use crate::util::{extract_tx_prevouts, full_hash, has_prevout, is_spendable, Bytes};
@@ -36,7 +36,7 @@ pub struct Mempool {
     feeinfo: HashMap<Txid, TxFeeInfo>,
     history: HashMap<FullHash, Vec<TxHistoryInfo>>, // ScriptHash -> {history_entries}
     edges: HashMap<OutPoint, (Txid, u32)>,          // OutPoint -> (spending_txid, spending_vin)
-    recent: ArrayDeque<[TxOverview; RECENT_TXS_SIZE], Wrapping>, // The N most recent txs to enter the mempool
+    recent: ArrayDeque<TxOverview, RECENT_TXS_SIZE, Wrapping>, // The N most recent txs to enter the mempool
     backlog_stats: (BacklogStats, Instant),
 
     // monitoring
@@ -56,7 +56,7 @@ pub struct Mempool {
 pub struct TxOverview {
     txid: Txid,
     fee: u64,
-    vsize: u32,
+    vsize: u64,
     #[cfg(not(feature = "liquid"))]
     value: u64,
 }
@@ -304,14 +304,18 @@ impl Mempool {
 
         // Update cached backlog stats (if expired)
         if self.backlog_stats.1.elapsed() > Duration::from_secs(BACKLOG_STATS_TTL) {
-            let _timer = self
-                .latency
-                .with_label_values(&["update_backlog_stats"])
-                .start_timer();
-            self.backlog_stats = (BacklogStats::new(&self.feeinfo), Instant::now());
+            self.update_backlog_stats();
         }
 
         Ok(())
+    }
+
+    pub fn update_backlog_stats(&mut self) {
+        let _timer = self
+            .latency
+            .with_label_values(&["update_backlog_stats"])
+            .start_timer();
+        self.backlog_stats = (BacklogStats::new(&self.feeinfo), Instant::now());
     }
 
     pub fn add_by_txid(&mut self, daemon: &Daemon, txid: &Txid) {
@@ -358,7 +362,10 @@ impl Mempool {
                 fee: feeinfo.fee,
                 vsize: feeinfo.vsize,
                 #[cfg(not(feature = "liquid"))]
-                value: prevouts.values().map(|prevout| prevout.value).sum(),
+                value: prevouts
+                    .values()
+                    .map(|prevout| prevout.value.to_sat())
+                    .sum(),
             });
 
             self.feeinfo.insert(txid, feeinfo);
@@ -373,7 +380,7 @@ impl Mempool {
                         vin: input_index as u16,
                         prev_txid: full_hash(&txi.previous_output.txid[..]),
                         prev_vout: txi.previous_output.vout as u16,
-                        value: prevout.value,
+                        value: prevout.value.amount_value(),
                     }),
                 )
             });
@@ -392,7 +399,7 @@ impl Mempool {
                         TxHistoryInfo::Funding(FundingInfo {
                             txid: txid_bytes,
                             vout: index as u16,
-                            value: txo.value,
+                            value: txo.value.amount_value(),
                         }),
                     )
                 });
@@ -522,9 +529,9 @@ impl Mempool {
 #[derive(Serialize)]
 pub struct BacklogStats {
     pub count: u32,
-    pub vsize: u32,     // in virtual bytes (= weight/4)
+    pub vsize: u64,     // in virtual bytes (= weight/4)
     pub total_fee: u64, // in satoshis
-    pub fee_histogram: Vec<(f32, u32)>,
+    pub fee_histogram: Vec<(f64, u64)>,
 }
 
 impl BacklogStats {
