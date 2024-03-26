@@ -20,6 +20,7 @@ use electrs::{
     config::Config,
     daemon::Daemon,
     electrum::RPC as ElectrumRPC,
+    json_logger::JsonLogger,
     metrics::Metrics,
     new_index::{ChainQuery, FetchFrom, Indexer, Mempool, Query, Store},
     rest,
@@ -86,6 +87,7 @@ impl TestRunner {
 
         let config = Arc::new(Config {
             log,
+            json_log: JsonLogger::new(),
             network_type,
             db_path: electrsdb.path().to_path_buf(),
             daemon_dir: daemon_subdir.clone(),
@@ -98,8 +100,10 @@ impl TestRunner {
             monitoring_addr: rand_available_addr(),
             jsonrpc_import: false,
             light_mode: false,
+            ignore_warn_feeinfo: false,
             address_search: true,
             index_unspendables: false,
+            ignore_check_initialblockdownload: false,
             cors: None,
             precache_scripts: None,
             utxos_limit: 100,
@@ -131,6 +135,7 @@ impl TestRunner {
             config.network_type,
             signal.clone(),
             &metrics,
+            config.ignore_check_initialblockdownload,
         )?);
 
         let store = Arc::new(Store::open(&config.db_path.join("newindex"), &config));
