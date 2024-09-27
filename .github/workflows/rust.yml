@@ -39,7 +39,15 @@ jobs:
       run: cargo check
 
     - name: Tests (Bitcoin mode, REST+Electrum)
-      run: cargo test
+      run: RUST_LOG=debug cargo test
 
     - name: Tests (Liquid mode, REST)
-      run: cargo test --features liquid
+      run: RUST_LOG=debug cargo test --features liquid
+
+  nix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: DeterminateSystems/nix-installer-action@main
+      - run: nix build .
+
