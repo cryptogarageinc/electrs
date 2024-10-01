@@ -1,5 +1,5 @@
 use arraydeque::{ArrayDeque, Wrapping};
-use itertools::Itertools;
+use itertools::{Either, Itertools};
 
 #[cfg(not(feature = "liquid"))]
 use bitcoin::consensus::encode::serialize;
@@ -8,7 +8,7 @@ use elements::{encode::serialize, AssetId};
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::iter::FromIterator;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::chain::{deserialize, Network, OutPoint, Transaction, TxOut, Txid};
@@ -276,38 +276,8 @@ impl Mempool {
         &self.backlog_stats.0
     }
 
-    pub fn update(&mut self, daemon: &Daemon) -> Result<()> {
-        let _timer = self.latency.with_label_values(&["update"]).start_timer();
-        let new_txids = daemon
-            .getmempooltxids()
-            .chain_err(|| "failed to update mempool from daemon")?;
-        let old_txids = HashSet::from_iter(self.txstore.keys().cloned());
-        let to_remove: HashSet<&Txid> = old_txids.difference(&new_txids).collect();
-
-        // Download and add new transactions from bitcoind's mempool
-        let txids: Vec<&Txid> = new_txids.difference(&old_txids).collect();
-        let to_add = match daemon.gettransactions(&txids) {
-            Ok(txs) => txs,
-            Err(err) => {
-                warn!("failed to get {} transactions: {}", txids.len(), err); // e.g. new block or RBF
-                return Ok(()); // keep the mempool until next update()
-            }
-        };
-        // Add new transactions
-        self.add(to_add);
-        // Remove missing transactions
-        self.remove(to_remove);
-
-        self.count
-            .with_label_values(&["txs"])
-            .set(self.txstore.len() as f64);
-
-        // Update cached backlog stats (if expired)
-        if self.backlog_stats.1.elapsed() > Duration::from_secs(BACKLOG_STATS_TTL) {
-            self.update_backlog_stats();
-        }
-
-        Ok(())
+    pub fn old_txids(&self) -> HashSet<Txid> {
+        return HashSet::from_iter(self.txstore.keys().cloned());
     }
 
     pub fn update_backlog_stats(&mut self) {
@@ -340,7 +310,7 @@ impl Mempool {
             self.txstore.insert(txid, tx);
         }
         // Phase 2: index history and spend edges (can fail if some txos cannot be found)
-        let txos = match self.lookup_txos(&self.get_prevouts(&txids)) {
+        let txos = match self.lookup_txos(self.get_prevouts(&txids)) {
             Ok(txos) => txos,
             Err(err) => {
                 warn!("lookup txouts failed: {}", err);
@@ -427,34 +397,29 @@ impl Mempool {
         }
     }
 
-    pub fn lookup_txo(&self, outpoint: &OutPoint) -> Result<TxOut> {
-        let mut outpoints = BTreeSet::new();
-        outpoints.insert(*outpoint);
-        Ok(self.lookup_txos(&outpoints)?.remove(outpoint).unwrap())
+    fn lookup_txo(&self, outpoint: &OutPoint) -> Option<TxOut> {
+        self.txstore
+            .get(&outpoint.txid)
+            .and_then(|tx| tx.output.get(outpoint.vout as usize).cloned())
     }
 
-    pub fn lookup_txos(&self, outpoints: &BTreeSet<OutPoint>) -> Result<HashMap<OutPoint, TxOut>> {
+    pub fn lookup_txos(&self, outpoints: BTreeSet<OutPoint>) -> Result<HashMap<OutPoint, TxOut>> {
         let _timer = self
             .latency
             .with_label_values(&["lookup_txos"])
             .start_timer();
 
-        let confirmed_txos = self.chain.lookup_avail_txos(outpoints);
+        // Get the txos available in the mempool, skipping over (and collecting) missing ones
+        let (mut txos, remain_outpoints): (HashMap<_, _>, _) = outpoints
+            .into_iter()
+            .partition_map(|outpoint| match self.lookup_txo(&outpoint) {
+                Some(txout) => Either::Left((outpoint, txout)),
+                None => Either::Right(outpoint),
+            });
 
-        let mempool_txos = outpoints
-            .iter()
-            .filter(|outpoint| !confirmed_txos.contains_key(outpoint))
-            .map(|outpoint| {
-                self.txstore
-                    .get(&outpoint.txid)
-                    .and_then(|tx| tx.output.get(outpoint.vout as usize).cloned())
-                    .map(|txout| (*outpoint, txout))
-                    .chain_err(|| format!("missing outpoint {:?}", outpoint))
-            })
-            .collect::<Result<HashMap<OutPoint, TxOut>>>()?;
+        // Get the remaining txos from the chain (fails if any are missing)
+        txos.extend(self.chain.lookup_txos(remain_outpoints)?);
 
-        let mut txos = confirmed_txos;
-        txos.extend(mempool_txos);
         Ok(txos)
     }
 
@@ -523,6 +488,46 @@ impl Mempool {
         self.asset_history
             .get(asset_id)
             .map_or_else(|| vec![], |entries| self._history(entries, limit))
+    }
+
+    pub fn update(mempool: &Arc<RwLock<Mempool>>, daemon: &Daemon) -> Result<()> {
+        let _timer = mempool.read().unwrap().latency.with_label_values(&["update"]).start_timer();
+
+        // 1. Determine which transactions are no longer in the daemon's mempool and which ones have newly entered it
+        let old_txids = mempool.read().unwrap().old_txids();
+        let all_txids = daemon
+            .getmempooltxids()
+            .chain_err(|| "failed to update mempool from daemon")?;
+        let txids_to_remove: HashSet<&Txid> = old_txids.difference(&all_txids).collect();
+
+        // 2. Remove missing transactions. Even if we are unable to download new transactions from
+        // the daemon, we still want to remove the transactions that are no longer in the mempool.
+        mempool.write().unwrap().remove(txids_to_remove);
+
+        // 3. Download the new transactions from the daemon's mempool
+        let new_txids: Vec<&Txid> = all_txids.difference(&old_txids).collect();
+        let txs_to_add = daemon
+            .gettransactions(&new_txids)
+            .chain_err(|| format!("failed to get {} transactions", new_txids.len()))?;
+
+        // 4. Update local mempool to match daemon's state
+        {
+            let mut mempool = mempool.write().unwrap();
+            // Add new transactions
+            mempool.add(txs_to_add);
+
+            mempool
+                .count
+                .with_label_values(&["txs"])
+                .set(mempool.txstore.len() as f64);
+
+            // Update cached backlog stats (if expired)
+            if mempool.backlog_stats.1.elapsed() > Duration::from_secs(BACKLOG_STATS_TTL) {
+                mempool.update_backlog_stats();
+            }
+        }
+
+        Ok(())
     }
 }
 

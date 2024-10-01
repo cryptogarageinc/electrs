@@ -1,6 +1,8 @@
+use std::str::FromStr;
 use std::sync::{Arc, Once, RwLock};
 use std::{env, net};
 
+use log::LevelFilter;
 use stderrlog::StdErrLog;
 use tempfile::TempDir;
 
@@ -54,11 +56,11 @@ impl TestRunner {
             #[cfg(feature = "liquid")]
             node_conf.args.push("-anyonecanspendaremine=1");
 
-            node_conf.view_stdout = true;
+            node_conf.view_stdout = std::env::var_os("RUST_LOG").is_some();
         }
 
         // Setup node
-        let node = NodeD::with_conf(noded::downloaded_exe_path().unwrap(), &node_conf).unwrap();
+        let node = NodeD::with_conf(noded::exe_path().unwrap(), &node_conf).unwrap();
 
         #[cfg(not(feature = "liquid"))]
         let (node_client, params) = (&node.client, &node.params);
@@ -115,6 +117,7 @@ impl TestRunner {
             asset_db_path: None, // XXX
             #[cfg(feature = "liquid")]
             parent_network: bitcoin::Network::Regtest,
+            initial_sync_compaction: false,
             //#[cfg(feature = "electrum-discovery")]
             //electrum_public_hosts: Option<crate::electrum::ServerHosts>,
             //#[cfg(feature = "electrum-discovery")]
@@ -167,7 +170,7 @@ impl TestRunner {
             &metrics,
             Arc::clone(&config),
         )));
-        mempool.write().unwrap().update(&daemon)?;
+        Mempool::update(&mempool, &daemon)?;
 
         let query = Arc::new(Query::new(
             Arc::clone(&chain),
@@ -199,10 +202,9 @@ impl TestRunner {
 
     pub fn sync(&mut self) -> Result<()> {
         self.indexer.update(&self.daemon)?;
-        let mut mempool = self.mempool.write().unwrap();
-        mempool.update(&self.daemon)?;
+        Mempool::update(&self.mempool, &self.daemon)?;
         // force an update for the mempool stats, which are normally cached
-        mempool.update_backlog_stats();
+        self.mempool.write().unwrap().update_backlog_stats();
         Ok(())
     }
 
@@ -316,7 +318,11 @@ fn generate(
 fn init_log() -> StdErrLog {
     static ONCE: Once = Once::new();
     let mut log = stderrlog::new();
-    log.verbosity(4);
+    match std::env::var("RUST_LOG") {
+        Ok(e) => log.verbosity(LevelFilter::from_str(&e).unwrap_or(LevelFilter::Off)),
+        Err(_) => log.verbosity(0),
+    };
+
     // log.timestamp(stderrlog::Timestamp::Millisecond        );
     ONCE.call_once(|| log.init().expect("logging initialization failed"));
     log
