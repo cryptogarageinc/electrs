@@ -1,0 +1,24 @@
+version: "3"
+tasks:
+  lint:
+    deps:
+      - task: :gha-lint
+      - task: :hadolint
+  gha-lint:
+    vars:
+      PINACT_VERSION: v2.2.1
+      ACTIONLINT_VERSION: v1.7.7
+      GHALINT_VERSION: v1.3.0
+    cmds:
+      - go run github.com/suzuki-shunsuke/pinact/v2/cmd/pinact@{{.PINACT_VERSION}} run
+      - go run github.com/rhysd/actionlint/cmd/actionlint@{{.ACTIONLINT_VERSION}}
+      - go run github.com/suzuki-shunsuke/ghalint/cmd/ghalint@{{.GHALINT_VERSION}} run
+  hadolint:
+    cmds:
+      - docker run --rm -i -v {{.TASK_DIR}}/.hadolint.yml:/.config/hadolint.yaml ghcr.io/hadolint/hadolint < Dockerfile
+      - docker run --rm -i -v {{.TASK_DIR}}/.hadolint.yml:/.config/hadolint.yaml ghcr.io/hadolint/hadolint < Dockerfile_bitcoin
+  format:
+    vars:
+      YAMLFMT_VERSION: v0.15.0
+    cmds:
+      - go run github.com/google/yamlfmt/cmd/yamlfmt@{{.YAMLFMT_VERSION}}
