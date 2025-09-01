@@ -115,7 +115,7 @@ jobs:
 
       - name: Run Trivy vulnerability scanner
         if: ${{ github.event_name != 'pull_request' }}
-        uses: aquasecurity/trivy-action@dc5a429b52fcf669ce959baa2c2dd26090d2a6c4 # 0.32.0
+        uses: aquasecurity/trivy-action@f9424c10c36e288d5fa79bd3dfd1aeb2d6eae808 # 0.33.0
         with:
           image-ref: ${{ steps.image_path.outputs.IMAGE_PATH }}:${{ steps.get_version.outputs.VERSION }}
           format: table
@@ -211,7 +211,7 @@ jobs:
 
       - name: Run Trivy vulnerability scanner
         if: ${{ github.event_name != 'pull_request' }}
-        uses: aquasecurity/trivy-action@dc5a429b52fcf669ce959baa2c2dd26090d2a6c4 # 0.32.0
+        uses: aquasecurity/trivy-action@f9424c10c36e288d5fa79bd3dfd1aeb2d6eae808 # 0.33.0
         with:
           image-ref: ${{ steps.image_path.outputs.IMAGE_PATH }}:${{ steps.get_version.outputs.VERSION }}-bitcoin
           format: table
