@@ -10,3 +10,9 @@ updates:
       - '.github/**/*'
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 3
+    groups:
+      dependencies:
+        patterns:
+          - "*"
