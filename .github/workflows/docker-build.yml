@@ -81,7 +81,7 @@ jobs:
 
       - name: Build only
         if: ${{ github.event_name == 'pull_request' }}
-        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           platforms: linux/amd64
@@ -91,7 +91,7 @@ jobs:
 
       - name: Build and push
         if: ${{ github.event_name != 'pull_request' }}
-        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           platforms: linux/amd64,linux/arm64
@@ -101,7 +101,7 @@ jobs:
 
       - name: Run Trivy vulnerability scanner
         if: ${{ github.event_name != 'pull_request' }}
-        uses: aquasecurity/trivy-action@b6643a29fecd7f34b3597bc6acb0a98b03d33ff8 # 0.33.1
+        uses: aquasecurity/trivy-action@c1824fd6edce30d7ab345a9989de00bbd46ef284 # 0.34.0
         with:
           image-ref: ${{ steps.image_path.outputs.IMAGE_PATH }}:${{ steps.get_version.outputs.VERSION }}
           format: table
@@ -176,7 +176,7 @@ jobs:
 
       - name: Build only
         if: ${{ github.event_name == 'pull_request' }}
-        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           file: ./Dockerfile_bitcoin
@@ -187,7 +187,7 @@ jobs:
 
       - name: Build and push
         if: ${{ github.event_name != 'pull_request' }}
-        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           file: ./Dockerfile_bitcoin
@@ -198,7 +198,7 @@ jobs:
 
       - name: Run Trivy vulnerability scanner
         if: ${{ github.event_name != 'pull_request' }}
-        uses: aquasecurity/trivy-action@b6643a29fecd7f34b3597bc6acb0a98b03d33ff8 # 0.33.1
+        uses: aquasecurity/trivy-action@c1824fd6edce30d7ab345a9989de00bbd46ef284 # 0.34.0
         with:
           image-ref: ${{ steps.image_path.outputs.IMAGE_PATH }}:${{ steps.get_version.outputs.VERSION }}-bitcoin
           format: table
