@@ -7,7 +7,7 @@ and [latest Electrum wallet](https://electrum.org/#download) (3.2+).
 Also, install the following packages (on Debian):
 ```bash
 $ sudo apt update
-$ sudo apt install clang cmake  # for building 'rust-rocksdb'
+$ sudo apt install clang cmake build-essential  # for building 'rust-rocksdb'
 ```
 
 ## Build
@@ -32,7 +32,7 @@ Otherwise, [`~/.bitcoin/.cookie`](https://github.com/bitcoin/bitcoin/blob/021218
 
 First index sync should take ~1.5 hours:
 ```bash
-$ cargo run --release -- -vvv --timestamp --db-dir ./db [--cookie="USER:PASSWORD"]
+$ cargo run --release -- --timestamp --db-dir ./db [--cookie="USER:PASSWORD"]
 2018-08-17T18:27:42 - INFO - NetworkInfo { version: 179900, subversion: "/Satoshi:0.17.99/" }
 2018-08-17T18:27:42 - INFO - BlockchainInfo { chain: "main", blocks: 537204, headers: 537204, bestblockhash: "0000000000000000002956768ca9421a8ddf4e53b1d81e429bd0125a383e3636", pruned: false, initialblockdownload: false }
 2018-08-17T18:27:42 - DEBUG - opening DB at "./db/mainnet"

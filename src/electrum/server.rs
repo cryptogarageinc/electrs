@@ -1,22 +1,19 @@
-use std::collections::HashMap;
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
-use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use bitcoin::hashes::sha256d::Hash as Sha256dHash;
-use crypto::digest::Digest;
-use crypto::sha2::Sha256;
+use bitcoin::hashes::{sha256, sha256d::Hash as Sha256dHash, Hash, HashEngine};
+use bitcoin::hex::DisplayHex;
 use error_chain::ChainedError;
-use hex::{self, DisplayHex};
+use rand::Rng;
 use serde_json::{from_str, Value};
 
-#[cfg(not(feature = "liquid"))]
-use bitcoin::consensus::encode::serialize_hex;
-#[cfg(feature = "liquid")]
-use elements::encode::serialize_hex;
+use electrs_macros::trace;
 
 use crate::chain::Txid;
 use crate::config::{Config, RpcLogging};
@@ -26,25 +23,40 @@ use crate::metrics::{Gauge, HistogramOpts, HistogramVec, MetricOpts, Metrics};
 use crate::new_index::{Query, Utxo};
 use crate::util::electrum_merkle::{get_header_merkle_proof, get_id_from_pos, get_tx_merkle_proof};
 use crate::util::{create_socket, spawn_thread, BlockId, BoolThen, Channel, FullHash, HeaderEntry};
+#[cfg(not(feature = "liquid"))]
+use bitcoin::consensus::encode::serialize_hex;
+#[cfg(feature = "liquid")]
+use elements::encode::serialize_hex;
 
 const ELECTRS_VERSION: &str = env!("CARGO_PKG_VERSION");
 const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 4);
 const MAX_HEADERS: usize = 2016;
+const MAX_ARRAY_BATCH: usize = 20;
 
 #[cfg(feature = "electrum-discovery")]
 use crate::electrum::{DiscoveryManager, ServerFeatures};
 
+fn invalid_params(msg: impl Into<String>) -> Error {
+    ErrorKind::InvalidParams(msg.into()).into()
+}
+
 // TODO: Sha256dHash should be a generic hash-container (since script hash is single SHA256)
 fn hash_from_value(val: Option<&Value>) -> Result<Sha256dHash> {
-    let script_hash = val.chain_err(|| "missing hash")?;
-    let script_hash = script_hash.as_str().chain_err(|| "non-string hash")?;
-    let script_hash = script_hash.parse().chain_err(|| "non-hex hash")?;
+    let script_hash = val.ok_or_else(|| invalid_params("missing hash"))?;
+    let script_hash = script_hash
+        .as_str()
+        .ok_or_else(|| invalid_params("non-string hash"))?;
+    let script_hash = script_hash
+        .parse()
+        .map_err(|_| invalid_params("non-hex hash"))?;
     Ok(script_hash)
 }
 
 fn usize_from_value(val: Option<&Value>, name: &str) -> Result<usize> {
-    let val = val.chain_err(|| format!("missing {}", name))?;
-    let val = val.as_u64().chain_err(|| format!("non-integer {}", name))?;
+    let val = val.ok_or_else(|| invalid_params(format!("missing {}", name)))?;
+    let val = val
+        .as_u64()
+        .ok_or_else(|| invalid_params(format!("non-integer {}", name)))?;
     Ok(val as usize)
 }
 
@@ -56,8 +68,10 @@ fn usize_from_value_or(val: Option<&Value>, name: &str, default: usize) -> Resul
 }
 
 fn bool_from_value(val: Option<&Value>, name: &str) -> Result<bool> {
-    let val = val.chain_err(|| format!("missing {}", name))?;
-    let val = val.as_bool().chain_err(|| format!("not a bool {}", name))?;
+    let val = val.ok_or_else(|| invalid_params(format!("missing {}", name)))?;
+    let val = val
+        .as_bool()
+        .ok_or_else(|| invalid_params(format!("not a bool {}", name)))?;
     Ok(val)
 }
 
@@ -68,13 +82,65 @@ fn bool_from_value_or(val: Option<&Value>, name: &str, default: bool) -> Result<
     bool_from_value(val, name)
 }
 
+// JSON-RPC 2.0 error codes (https://www.jsonrpc.org/specification#error_object),
+// plus the application-level codes used by ElectrumX and romanz/electrs.
+#[repr(i16)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JsonRpcV2Error {
+    ParseError = -32700,
+    InvalidRequest = -32600,
+    MethodNotFound = -32601,
+    InvalidParams = -32602,
+    InternalError = -32603,
+    BadRequest = 1,
+    DaemonError = 2,
+}
+
+impl JsonRpcV2Error {
+    #[inline]
+    fn into_i16(self) -> i16 {
+        self as i16
+    }
+}
+
+fn jsonrpc_code(e: &Error) -> JsonRpcV2Error {
+    match e.kind() {
+        ErrorKind::InvalidParams(_) => JsonRpcV2Error::InvalidParams,
+        ErrorKind::TooPopular | ErrorKind::TooManyUtxos | ErrorKind::TooManySubscriptions(_) => {
+            JsonRpcV2Error::BadRequest
+        }
+        // The daemon could not be reached (or we refused to queue for it) for a request
+        // made on the client's behalf. This is a downstream failure, not a client error.
+        ErrorKind::RpcError(..) | ErrorKind::DaemonBusy(_) | ErrorKind::DaemonUnavailable(_) => {
+            JsonRpcV2Error::DaemonError
+        }
+        _ => JsonRpcV2Error::InternalError,
+    }
+}
+
+#[inline]
+fn json_rpc_error(
+    input: impl core::fmt::Display,
+    id: Option<&Value>,
+    code: JsonRpcV2Error,
+) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id.unwrap_or(&Value::Null),
+        "error": {
+            "code": code.into_i16(),
+            "message": format!("{}", input),
+        },
+    })
+}
+
 // TODO: implement caching and delta updates
+#[trace]
 fn get_status_hash(txs: Vec<(Txid, Option<BlockId>)>, query: &Query) -> Option<FullHash> {
     if txs.is_empty() {
         None
     } else {
-        let mut hash = FullHash::default();
-        let mut sha2 = Sha256::new();
+        let mut engine = sha256::Hash::engine();
         for (txid, blockid) in txs {
             let is_mempool = blockid.is_none();
             let has_unconfirmed_parents = is_mempool
@@ -82,16 +148,23 @@ fn get_status_hash(txs: Vec<(Txid, Option<BlockId>)>, query: &Query) -> Option<F
                 .unwrap_or(false);
             let height = get_electrum_height(blockid, has_unconfirmed_parents);
             let part = format!("{}:{}:", txid, height);
-            sha2.input(part.as_bytes());
+            engine.input(part.as_bytes());
         }
-        sha2.result(&mut hash);
-        Some(hash)
+        Some(sha256::Hash::from_engine(engine).to_byte_array())
     }
+}
+
+fn subscription_allowed(
+    status_hashes: &HashMap<Sha256dHash, Value>,
+    script_hash: &Sha256dHash,
+    limit: usize,
+) -> bool {
+    limit == 0 || status_hashes.len() < limit || status_hashes.contains_key(script_hash)
 }
 
 macro_rules! conditionally_log_rpc_event {
     ($self:ident, $event:expr) => {
-        if $self.rpc_logging.is_some() {
+        if $self.rpc_logging.enabled {
             $self.log_rpc_event($event);
         }
     };
@@ -101,26 +174,43 @@ struct Connection {
     query: Arc<Query>,
     last_header_entry: Option<HeaderEntry>,
     status_hashes: HashMap<Sha256dHash, Value>, // ScriptHash -> StatusHash
-    stream: TcpStream,
+    // Shared with the connection reaper (via a Weak), which enforces the
+    // maximum connection age by shutting the socket down at the deadline.
+    stream: Arc<TcpStream>,
     addr: SocketAddr,
     sender: SyncSender<Message>,
     stats: Arc<Stats>,
     txs_limit: usize,
+    subscription_limit: usize,
+    max_request_bytes: usize,
+    checkpoint_proof_concurrency_limit: usize,
     #[cfg(feature = "electrum-discovery")]
     discovery: Option<Arc<DiscoveryManager>>,
-    rpc_logging: Option<RpcLogging>,
+    rpc_logging: RpcLogging,
+    salt: String,
+}
+
+fn hash_ip_with_salt(salt: &str, ip: &str) -> String {
+    let mut engine = sha256::Hash::engine();
+    engine.input(salt.as_bytes());
+    engine.input(ip.as_bytes());
+    format!("{:x}", sha256::Hash::from_engine(engine))
 }
 
 impl Connection {
     pub fn new(
         query: Arc<Query>,
-        stream: TcpStream,
+        stream: Arc<TcpStream>,
         addr: SocketAddr,
         sender: SyncSender<Message>,
         stats: Arc<Stats>,
         txs_limit: usize,
+        subscription_limit: usize,
+        max_request_bytes: usize,
+        checkpoint_proof_concurrency_limit: usize,
         #[cfg(feature = "electrum-discovery")] discovery: Option<Arc<DiscoveryManager>>,
-        rpc_logging: Option<RpcLogging>,
+        rpc_logging: RpcLogging,
+        salt: String,
     ) -> Connection {
         Connection {
             query,
@@ -131,9 +221,13 @@ impl Connection {
             sender,
             stats,
             txs_limit,
+            subscription_limit,
+            max_request_bytes,
+            checkpoint_proof_concurrency_limit,
             #[cfg(feature = "electrum-discovery")]
             discovery,
             rpc_logging,
+            salt,
         }
     }
 
@@ -191,9 +285,10 @@ impl Connection {
 
         let features = params
             .get(0)
-            .chain_err(|| "missing features param")?
+            .ok_or_else(|| invalid_params("missing features param"))?
             .clone();
-        let features = serde_json::from_value(features).chain_err(|| "invalid features")?;
+        let features =
+            serde_json::from_value(features).map_err(|_| invalid_params("invalid features"))?;
 
         discovery.add_server_request(self.addr.ip(), features)?;
         Ok(json!(true))
@@ -217,7 +312,12 @@ impl Connection {
         if cp_height == 0 {
             return Ok(json!(raw_header_hex));
         }
-        let (branch, root) = get_header_merkle_proof(self.query.chain(), height, cp_height)?;
+        let (branch, root) = get_header_merkle_proof(
+            self.query.chain(),
+            height,
+            cp_height,
+            self.checkpoint_proof_concurrency_limit,
+        )?;
 
         Ok(json!({
             "header": raw_header_hex,
@@ -249,8 +349,12 @@ impl Connection {
             }));
         }
 
-        let (branch, root) =
-            get_header_merkle_proof(self.query.chain(), start_height + (count - 1), cp_height)?;
+        let (branch, root) = get_header_merkle_proof(
+            self.query.chain(),
+            start_height + (count - 1),
+            cp_height,
+            self.checkpoint_proof_concurrency_limit,
+        )?;
 
         Ok(json!({
             "count": headers.len(),
@@ -261,6 +365,7 @@ impl Connection {
         }))
     }
 
+    #[trace]
     fn blockchain_estimatefee(&self, params: &[Value]) -> Result<Value> {
         let conf_target = usize_from_value(params.get(0), "blocks_count")?;
         let fee_rate = self
@@ -278,7 +383,12 @@ impl Connection {
     }
 
     fn blockchain_scripthash_subscribe(&mut self, params: &[Value]) -> Result<Value> {
-        let script_hash = hash_from_value(params.get(0)).chain_err(|| "bad script_hash")?;
+        let script_hash = hash_from_value(params.get(0))?;
+
+        ensure!(
+            subscription_allowed(&self.status_hashes, &script_hash, self.subscription_limit),
+            ErrorKind::TooManySubscriptions(self.subscription_limit)
+        );
 
         let history_txids = get_history(&self.query, &script_hash[..], self.txs_limit)?;
         let status_hash = get_status_hash(history_txids, &self.query)
@@ -291,7 +401,7 @@ impl Connection {
     }
 
     fn blockchain_scripthash_unsubscribe(&mut self, params: &[Value]) -> Result<Value> {
-        let script_hash = hash_from_value(params.get(0)).chain_err(|| "bad script_hash")?;
+        let script_hash = hash_from_value(params.get(0))?;
 
         match self.status_hashes.remove(&script_hash) {
             None => Ok(json!(false)),
@@ -304,7 +414,7 @@ impl Connection {
 
     #[cfg(not(feature = "liquid"))]
     fn blockchain_scripthash_get_balance(&self, params: &[Value]) -> Result<Value> {
-        let script_hash = hash_from_value(params.get(0)).chain_err(|| "bad script_hash")?;
+        let script_hash = hash_from_value(params.get(0))?;
         let (chain_stats, mempool_stats) = self.query.stats(&script_hash[..]);
 
         Ok(json!({
@@ -314,7 +424,7 @@ impl Connection {
     }
 
     fn blockchain_scripthash_get_history(&self, params: &[Value]) -> Result<Value> {
-        let script_hash = hash_from_value(params.get(0)).chain_err(|| "bad script_hash")?;
+        let script_hash = hash_from_value(params.get(0))?;
         let history_txids = get_history(&self.query, &script_hash[..], self.txs_limit)?;
 
         Ok(json!(history_txids
@@ -331,8 +441,29 @@ impl Connection {
             .collect::<Vec<_>>()))
     }
 
+    fn blockchain_scripthash_get_mempool(&self, params: &[Value]) -> Result<Value> {
+        let script_hash = hash_from_value(params.get(0))?;
+        // ask for one extra more than the limit and fail if it exists, to avoid silently truncating
+        let mempool_txids = self
+            .query
+            .mempool()
+            .history_txids(&script_hash[..], self.txs_limit + 1);
+        ensure!(mempool_txids.len() <= self.txs_limit, ErrorKind::TooPopular);
+
+        Ok(json!(mempool_txids
+            .into_iter()
+            .map(|txid| {
+                let fee = self.query.get_mempool_tx_fee(&txid);
+                let has_unconfirmed_parents = self.query.has_unconfirmed_parents(&txid);
+                // per the Electrum protocol: 0 if all inputs are confirmed, -1 otherwise
+                let height = if has_unconfirmed_parents { -1 } else { 0 };
+                GetHistoryResult { txid, height, fee }
+            })
+            .collect::<Vec<_>>()))
+    }
+
     fn blockchain_scripthash_listunspent(&self, params: &[Value]) -> Result<Value> {
-        let script_hash = hash_from_value(params.get(0)).chain_err(|| "bad script_hash")?;
+        let script_hash = hash_from_value(params.get(0))?;
         let utxos = self.query.utxo(&script_hash[..])?;
 
         let to_json = |utxo: Utxo| {
@@ -360,8 +491,11 @@ impl Connection {
     }
 
     fn blockchain_transaction_broadcast(&self, params: &[Value]) -> Result<Value> {
-        let tx = params.get(0).chain_err(|| "missing tx")?;
-        let tx = tx.as_str().chain_err(|| "non-string tx")?.to_string();
+        let tx = params.get(0).ok_or_else(|| invalid_params("missing tx"))?;
+        let tx = tx
+            .as_str()
+            .ok_or_else(|| invalid_params("non-string tx"))?
+            .to_string();
         let txid = self.query.broadcast_raw(&tx)?;
         if let Err(e) = self.sender.try_send(Message::PeriodicUpdate) {
             warn!("failed to issue PeriodicUpdate after broadcast: {}", e);
@@ -369,10 +503,33 @@ impl Connection {
         Ok(json!(txid))
     }
 
+    // Ported from romanz/electrs (https://github.com/romanz/electrs).
+    fn blockchain_transaction_broadcast_package(&self, params: &[Value]) -> Result<Value> {
+        let txhexes: Vec<String> = params
+            .get(0)
+            .ok_or_else(|| invalid_params("missing transactions"))
+            .and_then(|txs| {
+                serde_json::from_value(txs.clone())
+                    .map_err(|_| invalid_params("non-array transactions"))
+            })?;
+        let verbose = bool_from_value_or(params.get(1), "verbose", false)?;
+
+        let result = self.query.submit_package(txhexes, None, None)?;
+        if let Err(e) = self.sender.try_send(Message::PeriodicUpdate) {
+            warn!(
+                "failed to issue PeriodicUpdate after broadcast_package: {}",
+                e
+            );
+        }
+        Ok(result.into_electrum_response(verbose))
+    }
+
     fn blockchain_transaction_get(&self, params: &[Value]) -> Result<Value> {
-        let tx_hash = Txid::from(hash_from_value(params.get(0)).chain_err(|| "bad tx_hash")?);
+        let tx_hash = Txid::from(hash_from_value(params.get(0))?);
         let verbose = match params.get(1) {
-            Some(value) => value.as_bool().chain_err(|| "non-bool verbose value")?,
+            Some(value) => value
+                .as_bool()
+                .ok_or_else(|| invalid_params("non-bool verbose value"))?,
             None => false,
         };
 
@@ -388,8 +545,9 @@ impl Connection {
         Ok(json!(rawtx.to_lower_hex_string()))
     }
 
+    #[trace]
     fn blockchain_transaction_get_merkle(&self, params: &[Value]) -> Result<Value> {
-        let txid = Txid::from(hash_from_value(params.get(0)).chain_err(|| "bad tx_hash")?);
+        let txid = Txid::from(hash_from_value(params.get(0))?);
         let height = usize_from_value(params.get(1), "height")?;
         let blockid = self
             .query
@@ -397,7 +555,7 @@ impl Connection {
             .tx_confirming_block(&txid)
             .ok_or_else(|| "tx not found or is unconfirmed")?;
         if blockid.height != height {
-            bail!("invalid confirmation height provided");
+            return Err(invalid_params("invalid confirmation height provided"));
         }
         let (merkle, pos) = get_tx_merkle_proof(self.query.chain(), &txid, &blockid.hash)
             .chain_err(|| "cannot create merkle proof")?;
@@ -425,12 +583,14 @@ impl Connection {
         }))
     }
 
+    #[trace(method = %method)]
     fn handle_command(&mut self, method: &str, params: &[Value], id: &Value) -> Result<Value> {
         let timer = self
             .stats
             .latency
             .with_label_values(&[method])
             .start_timer();
+
         let result = match method {
             "blockchain.block.header" => self.blockchain_block_header(&params),
             "blockchain.block.headers" => self.blockchain_block_headers(&params),
@@ -440,10 +600,14 @@ impl Connection {
             #[cfg(not(feature = "liquid"))]
             "blockchain.scripthash.get_balance" => self.blockchain_scripthash_get_balance(&params),
             "blockchain.scripthash.get_history" => self.blockchain_scripthash_get_history(&params),
+            "blockchain.scripthash.get_mempool" => self.blockchain_scripthash_get_mempool(&params),
             "blockchain.scripthash.listunspent" => self.blockchain_scripthash_listunspent(&params),
             "blockchain.scripthash.subscribe" => self.blockchain_scripthash_subscribe(&params),
             "blockchain.scripthash.unsubscribe" => self.blockchain_scripthash_unsubscribe(&params),
             "blockchain.transaction.broadcast" => self.blockchain_transaction_broadcast(&params),
+            "blockchain.transaction.broadcast_package" => {
+                self.blockchain_transaction_broadcast_package(&params)
+            }
             "blockchain.transaction.get" => self.blockchain_transaction_get(&params),
             "blockchain.transaction.get_merkle" => self.blockchain_transaction_get_merkle(&params),
             "blockchain.transaction.id_from_pos" => {
@@ -461,10 +625,16 @@ impl Connection {
             #[cfg(feature = "electrum-discovery")]
             "server.add_peer" => self.server_add_peer(&params),
 
-            &_ => bail!("unknown method {} {:?}", method, params),
+            &_ => {
+                warn!("rpc #{} unknown method {} {:?}", id, method, params);
+                return Ok(json_rpc_error(
+                    format!("unknown method {}", method),
+                    Some(id),
+                    JsonRpcV2Error::MethodNotFound,
+                ));
+            }
         };
         timer.observe_duration();
-        // TODO: return application errors should be sent to the client
         Ok(match result {
             Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
             Err(e) => {
@@ -475,11 +645,12 @@ impl Connection {
                     params,
                     e.display_chain()
                 );
-                json!({"jsonrpc": "2.0", "id": id, "error": format!("{}", e)})
+                json_rpc_error(&e, Some(id), jsonrpc_code(&e))
             }
         })
     }
 
+    #[trace]
     fn update_subscriptions(&mut self) -> Result<Vec<Value>> {
         let timer = self
             .stats
@@ -517,10 +688,17 @@ impl Connection {
     }
 
     fn log_rpc_event(&self, mut log: Value) {
+        let real_ip = self.addr.ip().to_string();
+        let ip_to_log = if self.rpc_logging.anonymize_ip {
+            hash_ip_with_salt(&self.salt, &real_ip)
+        } else {
+            real_ip
+        };
+
         log.as_object_mut().unwrap().insert(
             "source".into(),
             json!({
-                "ip": self.addr.ip().to_string(),
+                "ip": ip_to_log,
                 "port": self.addr.port(),
             }),
         );
@@ -530,65 +708,43 @@ impl Connection {
     fn send_values(&mut self, values: &[Value]) -> Result<()> {
         for value in values {
             let line = value.to_string() + "\n";
-            self.stream
+            (&*self.stream)
                 .write_all(line.as_bytes())
-                .chain_err(|| format!("failed to send {}", value))?;
+                .chain_err(|| format!("failed to send response ({} bytes)", line.len()))?;
         }
         Ok(())
     }
 
+    #[trace]
     fn handle_replies(&mut self, receiver: Receiver<Message>) -> Result<()> {
         let empty_params = json!([]);
         loop {
             let msg = receiver.recv().chain_err(|| "channel closed")?;
-            let start_time = Instant::now();
             trace!("RPC {:?}", msg);
             match msg {
                 Message::Request(line) => {
-                    let cmd: Value = from_str(&line).chain_err(|| "invalid JSON format")?;
-                    match (
-                        cmd.get("method"),
-                        cmd.get("params").unwrap_or_else(|| &empty_params),
-                        cmd.get("id"),
-                    ) {
-                        (
-                            Some(&Value::String(ref method)),
-                            &Value::Array(ref params),
-                            Some(ref id),
-                        ) => {
-                            conditionally_log_rpc_event!(
-                                self,
-                                json!({
-                                    "event": "rpc request",
-                                    "id": id,
-                                    "method": method,
-                                    "params": if let Some(RpcLogging::Full) = self.rpc_logging {
-                                        json!(params)
-                                    } else {
-                                        Value::Null
-                                    }
-                                })
-                            );
-
-                            let reply = self.handle_command(method, params, id)?;
-
-                            conditionally_log_rpc_event!(
-                                self,
-                                json!({
-                                    "event": "rpc response",
-                                    "method": method,
-                                    "payload_size": reply.to_string().as_bytes().len(),
-                                    "duration_micros": start_time.elapsed().as_micros(),
-                                    "id": id,
-                                })
-                            );
-
-                            self.send_values(&[reply])?
+                    let reply = match from_str::<Value>(&line) {
+                        Ok(Value::Array(arr)) => {
+                            if arr.len() > MAX_ARRAY_BATCH {
+                                bail!(
+                                    "Too many elements in batch requests {} max:{}",
+                                    arr.len(),
+                                    MAX_ARRAY_BATCH
+                                );
+                            }
+                            let mut result = Vec::with_capacity(arr.len());
+                            for el in arr {
+                                result.push(self.handle_value(el, &empty_params));
+                            }
+                            Value::Array(result)
                         }
-                        _ => {
-                            bail!("invalid command: {}", cmd)
+                        Ok(cmd) => self.handle_value(cmd, &empty_params),
+                        Err(err) => {
+                            warn!("[{}] invalid JSON request: {}", self.addr, err);
+                            json_rpc_error("parse error", None, JsonRpcV2Error::ParseError)
                         }
-                    }
+                    };
+                    self.send_values(&[reply])?
                 }
                 Message::PeriodicUpdate => {
                     let values = self
@@ -601,12 +757,97 @@ impl Connection {
         }
     }
 
-    fn parse_requests(mut reader: BufReader<TcpStream>, tx: &SyncSender<Message>) -> Result<()> {
+    fn handle_value(&mut self, cmd: Value, empty_params: &Value) -> Value {
+        let start_time = Instant::now();
+        match (
+            cmd.get("method"),
+            cmd.get("params").unwrap_or_else(|| empty_params),
+            cmd.get("id"),
+        ) {
+            (Some(&Value::String(ref method)), &Value::Array(ref params), Some(ref id)) => {
+                let reply = self.handle_command(method, params, id).unwrap_or_else(|e| {
+                    json_rpc_error(
+                        format!("{} failed: {}", method, e),
+                        Some(id),
+                        JsonRpcV2Error::InternalError,
+                    )
+                });
+
+                conditionally_log_rpc_event!(
+                    self,
+                    json!({
+                        "event": "rpc_response",
+                        "method": method,
+                        "params": if self.rpc_logging.hide_params {
+                                Value::Null
+                            } else {
+                                json!(params)
+                            },
+                        "request_size": serde_json::to_vec(&cmd).map(|v| v.len()).unwrap_or(0),
+                        "response_size": reply.to_string().as_bytes().len(),
+                        "duration_micros": start_time.elapsed().as_micros(),
+                        "id": id,
+                    })
+                );
+
+                reply
+            }
+            _ => {
+                warn!("[{}] invalid request: {}", self.addr, cmd);
+                json_rpc_error(
+                    "invalid request",
+                    cmd.get("id"),
+                    JsonRpcV2Error::InvalidRequest,
+                )
+            }
+        }
+    }
+
+    fn read_bounded_line(reader: &mut BufReader<TcpStream>, max_len: usize) -> Result<Vec<u8>> {
+        let mut line = Vec::<u8>::new();
         loop {
-            let mut line = Vec::<u8>::new();
-            reader
-                .read_until(b'\n', &mut line)
-                .chain_err(|| "failed to read a request")?;
+            let (done, consumed) = {
+                let available = reader.fill_buf().chain_err(|| "failed to read a request")?;
+                if available.is_empty() {
+                    (true, 0) // EOF
+                } else if let Some(pos) = available.iter().position(|&b| b == b'\n') {
+                    let new_len = line
+                        .len()
+                        .checked_add(pos + 1)
+                        .ok_or_else(|| "request line length overflow")?;
+                    if new_len > max_len {
+                        bail!("request line exceeds maximum size of {} bytes", max_len);
+                    }
+                    line.extend_from_slice(&available[..=pos]);
+                    (true, pos + 1)
+                } else {
+                    let new_len = line
+                        .len()
+                        .checked_add(available.len())
+                        .ok_or_else(|| "request line length overflow")?;
+                    if new_len > max_len {
+                        bail!("request line exceeds maximum size of {} bytes", max_len);
+                    }
+                    let take = available.len();
+                    line.extend_from_slice(&available[..take]);
+                    (false, take)
+                }
+            };
+            reader.consume(consumed);
+            if done {
+                return Ok(line);
+            }
+        }
+    }
+
+    #[trace]
+    fn parse_requests(
+        mut reader: BufReader<TcpStream>,
+        tx: &SyncSender<Message>,
+        max_request_bytes: usize,
+    ) -> Result<()> {
+        loop {
+            let line = Connection::read_bounded_line(&mut reader, max_request_bytes)?;
             if line.is_empty() {
                 return Ok(());
             } else {
@@ -626,27 +867,41 @@ impl Connection {
         }
     }
 
-    fn reader_thread(reader: BufReader<TcpStream>, tx: SyncSender<Message>) -> Result<()> {
-        let result = Connection::parse_requests(reader, &tx);
+    fn reader_thread(
+        reader: BufReader<TcpStream>,
+        tx: SyncSender<Message>,
+        max_request_bytes: usize,
+    ) -> Result<()> {
+        let result = Connection::parse_requests(reader, &tx, max_request_bytes);
         if let Err(e) = tx.send(Message::Done) {
-            warn!("failed closing channel: {}", e);
+            // The writer already tore the channel down (e.g. after a write
+            // error or connection expiry) — expected during teardown races.
+            debug!("failed closing channel: {}", e);
         }
         result
     }
 
     pub fn run(mut self, receiver: Receiver<Message>) {
         self.stats.clients.inc();
-        conditionally_log_rpc_event!(self, json!({ "event": "connection established" }));
+        conditionally_log_rpc_event!(self, json!({ "event": "connection_established" }));
 
         let reader = BufReader::new(self.stream.try_clone().expect("failed to clone TcpStream"));
         let sender = self.sender.clone();
-        let child = spawn_thread("reader", || Connection::reader_thread(reader, sender));
+        let max_request_bytes = self.max_request_bytes;
+        let child = spawn_thread("reader", move || {
+            Connection::reader_thread(reader, sender, max_request_bytes)
+        });
         if let Err(e) = self.handle_replies(receiver) {
-            error!(
-                "[{}] connection handling failed: {}",
-                self.addr,
-                e.display_chain().to_string()
-            );
+            if is_disconnect(&e) {
+                // client went away mid-exchange (broken pipe / reset) — not actionable
+                debug!("[{}] connection closed by client: {}", self.addr, e);
+            } else {
+                error!(
+                    "[{}] connection handling failed: {}",
+                    self.addr,
+                    e.display_chain().to_string()
+                );
+            }
         }
         self.stats.clients.dec();
         self.stats
@@ -654,15 +909,184 @@ impl Connection {
             .sub(self.status_hashes.len() as i64);
 
         debug!("[{}] shutting down connection", self.addr);
-        conditionally_log_rpc_event!(self, json!({ "event": "connection closed" }));
+        conditionally_log_rpc_event!(self, json!({ "event": "connection_closed" }));
 
         let _ = self.stream.shutdown(Shutdown::Both);
         if let Err(err) = child.join().expect("receiver panicked") {
-            error!("[{}] receiver failed: {}", self.addr, err);
+            if is_disconnect(&err) || is_channel_closed(&err) {
+                // Reader failures rooted in a disconnect or in the reply
+                // channel tearing down are expected when the socket was shut
+                // down under it (client reset or expiry).
+                debug!("[{}] receiver closed: {}", self.addr, err);
+            } else {
+                error!("[{}] receiver failed: {}", self.addr, err);
+            }
         }
     }
 }
 
+fn connection_lifetime(max_age: Option<Duration>) -> Option<Duration> {
+    max_age.and_then(|max_age| {
+        let max_secs = max_age.as_secs();
+        if max_secs == 0 {
+            return None;
+        }
+        let min_secs = max_secs / 2 + max_secs % 2;
+        Some(Duration::from_secs(
+            rand::rng().random_range(min_secs..=max_secs),
+        ))
+    })
+}
+
+/// The absolute deadline for a new connection, jittered between 50% and 100% of
+/// `max_age`. `None` means the connection never expires — either the max age is
+/// disabled, or it is so large that the deadline is not representable.
+fn connection_deadline(max_age: Option<Duration>) -> Option<Instant> {
+    connection_lifetime(max_age).and_then(|lifetime| Instant::now().checked_add(lifetime))
+}
+
+/// A connection registered with the reaper: shut `stream` down at `expires_at`.
+struct ConnectionExpiry {
+    expires_at: Instant,
+    addr: SocketAddr,
+    // Weak so the reaper never keeps the socket (and its fd) alive after the
+    // connection ends on its own before the deadline.
+    stream: Weak<TcpStream>,
+}
+
+enum ReaperMessage {
+    Register(ConnectionExpiry),
+    Shutdown,
+}
+
+// Ordered by soonest deadline first, so a BinaryHeap acts as a min-heap.
+impl Ord for ConnectionExpiry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other.expires_at.cmp(&self.expires_at)
+    }
+}
+
+impl PartialOrd for ConnectionExpiry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for ConnectionExpiry {
+    fn eq(&self, other: &Self) -> bool {
+        self.expires_at == other.expires_at
+    }
+}
+
+impl Eq for ConnectionExpiry {}
+
+/// Compact the expiry queue once it reaches this many entries.
+const REAPER_COMPACT_MIN: usize = 1024;
+
+/// Pending connection expiries, ordered by soonest deadline. Entries for
+/// connections that ended before their deadline are dropped by an amortized
+/// compaction pass on registration, so the queue stays proportional to the
+/// number of live connections even under high connection churn combined with
+/// a large max age.
+struct ExpiryQueue {
+    expiries: BinaryHeap<ConnectionExpiry>,
+    compact_at: usize,
+}
+
+impl ExpiryQueue {
+    fn new() -> ExpiryQueue {
+        ExpiryQueue {
+            expiries: BinaryHeap::new(),
+            compact_at: REAPER_COMPACT_MIN,
+        }
+    }
+
+    fn register(&mut self, expiry: ConnectionExpiry) {
+        self.expiries.push(expiry);
+        if self.expiries.len() >= self.compact_at {
+            self.expiries.retain(|e| e.stream.strong_count() > 0);
+            self.compact_at = REAPER_COMPACT_MIN.max(self.expiries.len() * 2);
+        }
+    }
+
+    /// Shut down every connection whose deadline has passed.
+    fn reap_due(&mut self, now: Instant) {
+        while self.expiries.peek().map_or(false, |e| e.expires_at <= now) {
+            let expiry = self.expiries.pop().unwrap();
+            // A connection that already ended no longer upgrades.
+            if let Some(stream) = expiry.stream.upgrade() {
+                debug!(
+                    "[{}] maximum connection age reached, closing connection",
+                    expiry.addr
+                );
+                let _ = stream.shutdown(Shutdown::Both);
+            }
+        }
+    }
+
+    fn next_deadline(&self) -> Option<Instant> {
+        self.expiries.peek().map(|e| e.expires_at)
+    }
+}
+
+/// Enforces the maximum connection age for all Electrum RPC connections by
+/// shutting each socket down at its absolute deadline. The shutdown unblocks
+/// both peer threads even when the writer is stuck in a blocking write to a
+/// client that stopped reading, which an in-band expiry check between messages
+/// could never catch. Runs until a `Shutdown` message arrives or the
+/// registration channel is closed.
+fn reap_expired_connections(registrations: Receiver<ReaperMessage>) {
+    let mut queue = ExpiryQueue::new();
+    loop {
+        queue.reap_due(Instant::now());
+        let next = match queue.next_deadline() {
+            Some(deadline) => {
+                registrations.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            }
+            None => registrations.recv().map_err(RecvTimeoutError::from),
+        };
+        match next {
+            Ok(ReaperMessage::Register(registration)) => queue.register(registration),
+            Ok(ReaperMessage::Shutdown) | Err(RecvTimeoutError::Disconnected) => return,
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+    }
+}
+
+/// True if the error chain is rooted in a client disconnect (broken pipe /
+/// connection reset / aborted), which is expected and shouldn't be logged as ERROR.
+fn is_disconnect(err: &Error) -> bool {
+    use std::io::ErrorKind::*;
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = cause {
+        if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
+            if matches!(
+                io_err.kind(),
+                BrokenPipe | ConnectionReset | ConnectionAborted | UnexpectedEof
+            ) {
+                return true;
+            }
+        }
+        cause = e.source();
+    }
+    false
+}
+
+/// True if the error chain is rooted in the reply channel closing, meaning the
+/// writer half tore down first (e.g. on connection expiry or a write error)
+/// while the reader still had a request in flight — expected during teardown.
+fn is_channel_closed(err: &Error) -> bool {
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = cause {
+        if e.downcast_ref::<mpsc::SendError<Message>>().is_some() {
+            return true;
+        }
+        cause = e.source();
+    }
+    false
+}
+
+#[trace]
 fn get_history(
     query: &Query,
     scripthash: &[u8],
@@ -710,7 +1134,7 @@ impl RPC {
     fn start_notifier(
         notification: Channel<Notification>,
         senders: Arc<Mutex<Vec<SyncSender<Message>>>>,
-        acceptor: Sender<Option<(TcpStream, SocketAddr)>>,
+        acceptor: Sender<Option<(Arc<TcpStream>, SocketAddr)>>,
     ) {
         spawn_thread("notification", move || {
             for msg in notification.receiver().iter() {
@@ -727,13 +1151,21 @@ impl RPC {
                             }
                         })
                     }
-                    Notification::Exit => acceptor.send(None).unwrap(), // mark acceptor as done
+                    Notification::Exit => {
+                        if acceptor.send(None).is_err() {
+                            warn!("acceptor already shut down before Exit notification");
+                        }
+                    }
                 }
             }
         });
     }
 
-    fn start_acceptor(addr: SocketAddr) -> Channel<Option<(TcpStream, SocketAddr)>> {
+    fn start_acceptor(
+        addr: SocketAddr,
+        conn_max_age: Option<Duration>,
+        reaper: Option<mpsc::Sender<ReaperMessage>>,
+    ) -> Channel<Option<(Arc<TcpStream>, SocketAddr)>> {
         let chan = Channel::unbounded();
         let acceptor = chan.sender();
         spawn_thread("acceptor", move || {
@@ -750,13 +1182,34 @@ impl RPC {
                 stream
                     .set_nonblocking(false)
                     .expect("failed to set connection as blocking");
-                acceptor.send(Some((stream, addr))).expect("send failed");
+                stream.set_nodelay(true).expect("failed to set TCP_NODELAY");
+                // Register with the reaper before enqueueing, so the deadline
+                // is anchored to the accept and enforced even while the socket
+                // waits behind other new connections during an accept burst.
+                let stream = Arc::new(stream);
+                if let Some(reaper) = &reaper {
+                    if let Some(expires_at) = connection_deadline(conn_max_age) {
+                        let _ = reaper.send(ReaperMessage::Register(ConnectionExpiry {
+                            expires_at,
+                            addr,
+                            stream: Arc::downgrade(&stream),
+                        }));
+                    }
+                }
+                if acceptor.send(Some((stream, addr))).is_err() {
+                    break; // receiver dropped, server is shutting down
+                }
             }
         });
         chan
     }
 
-    pub fn start(config: Arc<Config>, query: Arc<Query>, metrics: &Metrics) -> RPC {
+    pub fn start(
+        config: Arc<Config>,
+        query: Arc<Query>,
+        metrics: &Metrics,
+        salt_rwlock: Arc<RwLock<String>>,
+    ) -> RPC {
         let stats = Arc::new(Stats {
             latency: metrics.histogram_vec(
                 HistogramOpts::new("electrum_rpc", "Electrum RPC latency (seconds)"),
@@ -799,13 +1252,31 @@ impl RPC {
 
         let rpc_addr = config.electrum_rpc_addr;
         let txs_limit = config.electrum_txs_limit;
+        let subscription_limit = config.electrum_subscription_limit;
+        let max_request_bytes = config.electrum_rpc_max_request_num_bytes;
+        let checkpoint_proof_concurrency_limit = config.electrum_checkpoint_proof_concurrency_limit;
+        let conn_max_age = config.electrum_rpc_conn_max_age;
 
         RPC {
             notification: notification.sender(),
             server: Some(spawn_thread("rpc", move || {
                 let senders = Arc::new(Mutex::new(Vec::<SyncSender<Message>>::new()));
 
-                let acceptor = RPC::start_acceptor(rpc_addr);
+                // The reaper enforces the maximum connection age. It is
+                // stopped with an explicit Shutdown message below, since the
+                // acceptor's sender clone can outlive this thread (the
+                // acceptor stays blocked in accept() during shutdown).
+                let reaper = conn_max_age.map(|_| {
+                    let (sender, receiver) = mpsc::channel();
+                    let handle = spawn_thread("reaper", move || reap_expired_connections(receiver));
+                    (sender, handle)
+                });
+
+                let acceptor = RPC::start_acceptor(
+                    rpc_addr,
+                    conn_max_age,
+                    reaper.as_ref().map(|(sender, _)| sender.clone()),
+                );
                 RPC::start_notifier(notification, senders.clone(), acceptor.sender());
 
                 let mut threads = HashMap::new();
@@ -816,15 +1287,17 @@ impl RPC {
                     let query = Arc::clone(&query);
                     let stats = Arc::clone(&stats);
                     let garbage_sender = garbage_sender.clone();
-                    let rpc_logging = config.electrum_rpc_logging.clone();
+                    let rpc_logging = config.rpc_logging.clone();
                     #[cfg(feature = "electrum-discovery")]
                     let discovery = discovery.clone();
 
                     let (sender, receiver) = mpsc::sync_channel(10);
                     senders.lock().unwrap().push(sender.clone());
 
+                    let salt = salt_rwlock.read().unwrap().clone();
+
                     let spawned = spawn_thread("peer", move || {
-                        info!("[{}] connected peer", addr);
+                        debug!("[{}] connected peer", addr);
                         let conn = Connection::new(
                             query,
                             stream,
@@ -832,12 +1305,16 @@ impl RPC {
                             sender,
                             stats,
                             txs_limit,
+                            subscription_limit,
+                            max_request_bytes,
+                            checkpoint_proof_concurrency_limit,
                             #[cfg(feature = "electrum-discovery")]
                             discovery,
                             rpc_logging,
+                            salt,
                         );
                         conn.run(receiver);
-                        info!("[{}] disconnected peer", addr);
+                        debug!("[{}] disconnected peer", addr);
                         let _ = garbage_sender.send(std::thread::current().id());
                     });
 
@@ -866,6 +1343,12 @@ impl RPC {
                 }
 
                 trace!("RPC connections are closed");
+
+                if let Some((sender, handle)) = reaper {
+                    let _ = sender.send(ReaperMessage::Shutdown);
+                    handle.join().expect("reaper panicked");
+                    trace!("reaper stopped");
+                }
             })),
         }
     }
@@ -883,5 +1366,341 @@ impl Drop for RPC {
             handle.join().unwrap();
         }
         trace!("RPC server is stopped");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_hash_ip_with_salt() {
+        // SHA-256("test_salt" || "127.0.0.1")
+        let result = hash_ip_with_salt("test_salt", "127.0.0.1");
+        assert_eq!(
+            result,
+            "d474826bbd126d38bdfb1e61bf727a2d9a306ea1645071faf2638cc3891a2b30"
+        );
+    }
+
+    fn tracking(count: usize) -> HashMap<Sha256dHash, Value> {
+        (0..count)
+            .map(|i| (scripthash(i as u64), Value::Null))
+            .collect()
+    }
+
+    fn scripthash(seed: u64) -> Sha256dHash {
+        let mut bytes = [0u8; 32];
+        bytes[..8].copy_from_slice(&seed.to_le_bytes());
+        Sha256dHash::from_byte_array(bytes)
+    }
+
+    #[test]
+    fn subscription_limit_of_zero_is_unlimited() {
+        let tracked = tracking(1_000);
+        assert!(subscription_allowed(&tracked, &scripthash(200), 0));
+    }
+
+    #[test]
+    fn subscription_allowed_below_the_limit() {
+        let tracked = tracking(3);
+        assert!(subscription_allowed(&tracked, &scripthash(200), 4));
+    }
+
+    #[test]
+    fn new_subscription_refused_at_the_limit() {
+        let tracked = tracking(4);
+        assert!(!subscription_allowed(&tracked, &scripthash(200), 4));
+        assert!(!subscription_allowed(&tracked, &scripthash(200), 2));
+    }
+
+    #[test]
+    fn resubscribing_to_a_tracked_scripthash_is_allowed_at_the_limit() {
+        let tracked = tracking(4);
+        assert!(subscription_allowed(&tracked, &scripthash(0), 4));
+        assert!(subscription_allowed(&tracked, &scripthash(3), 4));
+    }
+
+    #[test]
+    fn too_many_subscriptions_is_a_bad_request() {
+        let error = ErrorKind::TooManySubscriptions(4).into();
+        assert!(jsonrpc_code(&error) == JsonRpcV2Error::BadRequest);
+        assert_eq!(jsonrpc_code(&error).into_i16(), 1);
+    }
+
+    #[test]
+    fn connection_lifetime_is_disabled_without_max_age() {
+        assert_eq!(connection_lifetime(None), None);
+        assert_eq!(connection_lifetime(Some(Duration::ZERO)), None);
+    }
+
+    #[test]
+    fn connection_lifetime_is_jittered_up_to_max_age() {
+        let max_age = Duration::from_secs(3_600);
+        for _ in 0..100 {
+            let lifetime = connection_lifetime(Some(max_age)).unwrap();
+            assert!(lifetime >= Duration::from_secs(1_800));
+            assert!(lifetime <= max_age);
+        }
+    }
+
+    #[test]
+    fn connection_expiry_does_not_overflow() {
+        // A max age too large to be representable as a deadline must mean
+        // "never expires", not a panic.
+        assert_eq!(
+            connection_deadline(Some(Duration::from_secs(u64::MAX))),
+            None
+        );
+        assert_eq!(connection_deadline(None), None);
+        assert!(connection_deadline(Some(Duration::from_secs(3_600))).is_some());
+    }
+
+    /// Spawn a reaper and register `stream` to expire at `expires_at`.
+    fn spawn_reaper(stream: &Arc<TcpStream>, expires_at: Instant) -> mpsc::Sender<ReaperMessage> {
+        let (registrations, receiver) = mpsc::channel();
+        thread::spawn(move || reap_expired_connections(receiver));
+        registrations
+            .send(ReaperMessage::Register(ConnectionExpiry {
+                expires_at,
+                addr: stream.peer_addr().unwrap(),
+                stream: Arc::downgrade(stream),
+            }))
+            .unwrap();
+        registrations
+    }
+
+    #[test]
+    fn reaper_stops_on_shutdown_message() {
+        let (registrations, receiver) = mpsc::channel();
+        let reaper = thread::spawn(move || reap_expired_connections(receiver));
+        // A pending far-future registration must not delay the shutdown.
+        registrations
+            .send(ReaperMessage::Register(ConnectionExpiry {
+                expires_at: Instant::now() + Duration::from_secs(3_600),
+                addr: "127.0.0.1:1".parse().unwrap(),
+                stream: std::sync::Weak::new(),
+            }))
+            .unwrap();
+        registrations.send(ReaperMessage::Shutdown).unwrap();
+        reaper.join().unwrap();
+    }
+
+    #[test]
+    fn reaper_closes_connection_of_client_that_stops_reading() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        // A client that never reads its socket: writes towards it fill the
+        // kernel buffers and then block indefinitely.
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let stream = Arc::new(listener.accept().unwrap().0);
+
+        let started = Instant::now();
+        let expires_at = started + Duration::from_millis(200);
+        let _registrations = spawn_reaper(&stream, expires_at);
+
+        let (done_sender, done_receiver) = mpsc::channel();
+        let writer = Arc::clone(&stream);
+        thread::spawn(move || {
+            let chunk = [0u8; 1 << 20];
+            while (&*writer).write_all(&chunk).is_ok() {}
+            let _ = done_sender.send(());
+        });
+
+        // The blocked write must be forced to fail at the deadline, not linger
+        // for as long as the client keeps the socket open.
+        done_receiver
+            .recv_timeout(Duration::from_secs(30))
+            .expect("writer stayed blocked past the connection deadline");
+        assert!(started.elapsed() >= Duration::from_millis(200));
+        drop(client);
+    }
+
+    #[test]
+    fn reaper_queue_drops_entries_of_finished_connections() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (live_stream, addr) = listener.accept().unwrap();
+        let live_stream = Arc::new(live_stream);
+
+        // A Weak whose connection already ended (strong count is zero).
+        let dead = {
+            let stream = Arc::new(TcpStream::connect(listener.local_addr().unwrap()).unwrap());
+            Arc::downgrade(&stream)
+        };
+
+        // Far-future deadlines: without compaction, the entries below would
+        // all sit in the queue until the deadline no matter that their
+        // connections are long gone.
+        let expires_at = Instant::now() + Duration::from_secs(3_600);
+        let mut queue = ExpiryQueue::new();
+        for _ in 0..(REAPER_COMPACT_MIN - 1) {
+            queue.register(ConnectionExpiry {
+                expires_at,
+                addr,
+                stream: dead.clone(),
+            });
+        }
+        // This registration reaches the compaction threshold, so the pass runs
+        // with both the dead entries and this live one in the queue.
+        queue.register(ConnectionExpiry {
+            expires_at,
+            addr,
+            stream: Arc::downgrade(&live_stream),
+        });
+
+        // Compaction dropped the dead entries and kept the live one.
+        assert_eq!(queue.expiries.len(), 1);
+        assert!(queue.expiries.peek().unwrap().stream.upgrade().is_some());
+    }
+
+    #[test]
+    fn reply_channel_teardown_is_not_logged_as_error() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        drop(receiver);
+        let err: Error = sender
+            .send(Message::Done)
+            .chain_err(|| "channel closed")
+            .unwrap_err();
+        assert!(is_channel_closed(&err));
+        assert!(!is_channel_closed(&"unrelated".into()));
+    }
+
+    #[test]
+    fn reaper_does_not_keep_finished_connections_alive() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let stream = Arc::new(listener.accept().unwrap().0);
+
+        let weak = Arc::downgrade(&stream);
+        let _registrations = spawn_reaper(&stream, Instant::now() + Duration::from_secs(3_600));
+
+        // The reaper holds only a Weak: once the connection is done with the
+        // stream, the socket must close immediately instead of staying open
+        // (leaking the fd) until the deadline.
+        drop(stream);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn read_bounded_line_reads_a_normal_line() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let mut reader = BufReader::new(listener.accept().unwrap().0);
+
+        client.write_all(b"hello world\n").unwrap();
+        let line = Connection::read_bounded_line(&mut reader, 1024).unwrap();
+        assert_eq!(line, b"hello world\n");
+    }
+
+    #[test]
+    fn read_bounded_line_rejects_a_line_without_a_newline_past_the_limit() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let mut reader = BufReader::new(listener.accept().unwrap().0);
+
+        // Stream well past the limit with no '\n': the never-terminated-line
+        // OOM this guards against.
+        let chunk = [b'A'; 4096];
+        let writer = thread::spawn(move || {
+            for _ in 0..64 {
+                if client.write_all(&chunk).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let err = Connection::read_bounded_line(&mut reader, 1024).unwrap_err();
+        assert!(err.to_string().contains("exceeds maximum size"));
+        let _ = writer.join();
+    }
+
+    #[test]
+    fn read_bounded_line_rejects_a_line_whose_terminating_newline_arrives_over_the_limit() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let mut reader = BufReader::new(listener.accept().unwrap().0);
+
+        // The '\n' lands in the same fill_buf() chunk that pushes the
+        // accumulated line past the limit, so `done` is true on the very
+        // iteration where the size check must fire.
+        let mut payload = vec![b'A'; 2048];
+        payload.push(b'\n');
+        client.write_all(&payload).unwrap();
+
+        let err = Connection::read_bounded_line(&mut reader, 1024).unwrap_err();
+        assert!(err.to_string().contains("exceeds maximum size"));
+    }
+
+    #[test]
+    fn read_bounded_line_returns_empty_on_immediate_eof() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let mut reader = BufReader::new(listener.accept().unwrap().0);
+
+        drop(client);
+        let line = Connection::read_bounded_line(&mut reader, 1024).unwrap();
+        assert!(line.is_empty());
+    }
+
+    #[test]
+    fn read_bounded_line_returns_partial_line_on_eof_without_newline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let mut reader = BufReader::new(listener.accept().unwrap().0);
+
+        client.write_all(b"no newline here").unwrap();
+        drop(client);
+
+        let line = Connection::read_bounded_line(&mut reader, 1024).unwrap();
+        assert_eq!(line, b"no newline here");
+    }
+
+    #[test]
+    fn read_bounded_line_accepts_a_line_exactly_at_the_limit() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let mut reader = BufReader::new(listener.accept().unwrap().0);
+
+        let payload = vec![b'A'; 1024];
+        client.write_all(&payload).unwrap();
+        drop(client);
+
+        let line = Connection::read_bounded_line(&mut reader, 1024).unwrap();
+        assert_eq!(line, payload);
+    }
+
+    #[test]
+    fn read_bounded_line_rejects_a_single_chunk_exceeding_a_small_limit() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let mut reader = BufReader::new(listener.accept().unwrap().0);
+
+        // A single write, well within the reader's default 8KiB buffer, that
+        // still lands entirely in one fill_buf() call and exceeds a limit
+        // much smaller than that buffer.
+        let payload = vec![b'A'; 500];
+        client.write_all(&payload).unwrap();
+
+        let err = Connection::read_bounded_line(&mut reader, 100).unwrap_err();
+        assert!(err.to_string().contains("exceeds maximum size"));
+    }
+
+    #[test]
+    fn read_bounded_line_handles_unlimited_max_len_split_across_writes() {
+        // max_len == usize::MAX is what a configured value of 0 ("unlimited")
+        // maps to. Splitting the request and its terminating newline across
+        // separate writes forces at least one fill_buf() call to return a
+        // newline-less chunk, which used to compute `max_len + 1` and
+        // overflow.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let mut reader = BufReader::new(listener.accept().unwrap().0);
+
+        client.write_all(b"server.ping").unwrap();
+        thread::sleep(Duration::from_millis(50));
+        client.write_all(b"\n").unwrap();
+
+        let line = Connection::read_bounded_line(&mut reader, usize::MAX).unwrap();
+        assert_eq!(line, b"server.ping\n");
     }
 }

@@ -5,24 +5,31 @@ use crate::chain::{
 use crate::config::Config;
 use crate::errors;
 use crate::new_index::{compute_script_hash, Query, SpendingInput, Utxo};
+#[cfg(feature = "liquid")]
+use crate::util::optional_value_for_newer_blocks;
 use crate::util::{
     create_socket, electrum_merkle, extract_tx_prevouts, get_innerscripts, get_tx_fee, has_prevout,
     is_coinbase, BlockHeaderMeta, BlockId, FullHash, ScriptToAddr, ScriptToAsm, TransactionStatus,
     DEFAULT_BLOCKHASH,
 };
-
 #[cfg(not(feature = "liquid"))]
 use bitcoin::consensus::encode;
 
 use bitcoin::hashes::FromSliceError as HashError;
-use hex::{DisplayHex, FromHex};
-use hyper::service::{make_service_fn, service_fn};
-use hyper::{Body, Method, Response, Server, StatusCode};
-use hyperlocal::UnixServerExt;
+use bitcoin::hex::{self, DisplayHex, FromHex, HexToBytesIter};
+use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
+use hyper::server::conn::http1::Builder as ServerBuilder;
+use hyper::{body::Bytes, service::service_fn, Method, Response, StatusCode};
+use hyper_util::rt::{TokioIo, TokioTimer};
+use hyper_util::server::graceful::GracefulShutdown;
+use tokio::net::{TcpListener, UnixListener};
 use tokio::sync::oneshot;
 
-use std::fs;
+use std::pin::pin;
 use std::str::FromStr;
+use std::{fs, time};
+
+use electrs_macros::trace;
 
 #[cfg(feature = "liquid")]
 use {
@@ -31,7 +38,6 @@ use {
 };
 
 use serde::Serialize;
-use serde_json;
 use std::collections::HashMap;
 use std::num::ParseIntError;
 use std::os::unix::fs::FileTypeExt;
@@ -44,10 +50,16 @@ const MAX_MEMPOOL_TXS: usize = 50;
 const BLOCK_LIMIT: usize = 10;
 const ADDRESS_SEARCH_LIMIT: usize = 10;
 
+const REQUEST_HEADER_TIMEOUT: time::Duration = time::Duration::from_secs(10);
+const REQUEST_BODY_TIMEOUT: time::Duration = time::Duration::from_secs(30);
+const MAX_BODY_SIZE: usize = 1_000_000;
+
 #[cfg(feature = "liquid")]
 const ASSETS_PER_PAGE: usize = 25;
 #[cfg(feature = "liquid")]
 const ASSETS_MAX_PER_PAGE: usize = 100;
+#[cfg(feature = "liquid")]
+const START_OF_LIQUID_DISCOUNT_CT_POLICY: u32 = 1734120000; // Friday, December 13, 2024, 20:00 GMT
 
 const TTL_LONG: u32 = 157_784_630; // ttl for static resources (5 years)
 const TTL_SHORT: u32 = 10; // ttl for volatie resources
@@ -127,6 +139,14 @@ struct TransactionValue {
     fee: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     status: Option<TransactionStatus>,
+
+    #[cfg(feature = "liquid")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    discount_vsize: Option<usize>,
+
+    #[cfg(feature = "liquid")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    discount_weight: Option<usize>,
 }
 
 impl TransactionValue {
@@ -158,7 +178,7 @@ impl TransactionValue {
         let weight = weight.to_wu();
 
         TransactionValue {
-            txid: tx.txid(),
+            txid: tx.compute_txid(),
             #[cfg(not(feature = "liquid"))]
             version: tx.version.0 as u32,
             #[cfg(feature = "liquid")]
@@ -170,6 +190,20 @@ impl TransactionValue {
             weight: weight as u64,
             fee,
             status: Some(TransactionStatus::from(blockid)),
+
+            #[cfg(feature = "liquid")]
+            discount_vsize: optional_value_for_newer_blocks(
+                blockid,
+                START_OF_LIQUID_DISCOUNT_CT_POLICY,
+                tx.discount_vsize(),
+            ),
+
+            #[cfg(feature = "liquid")]
+            discount_weight: optional_value_for_newer_blocks(
+                blockid,
+                START_OF_LIQUID_DISCOUNT_CT_POLICY,
+                tx.discount_weight(),
+            ),
         }
     }
 }
@@ -319,7 +353,7 @@ impl TxOutValue {
             "v0_p2wsh"
         } else if script.is_p2tr() {
             "v1_p2tr"
-        } else if script.is_provably_unspendable() {
+        } else if script.is_op_return() {
             "provably_unspendable"
         } else {
             "unknown"
@@ -475,61 +509,115 @@ fn prepare_txs(
         .collect()
 }
 
+fn spawn_conn(
+    stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    query: Arc<Query>,
+    config: Arc<Config>,
+    graceful: &GracefulShutdown,
+) {
+    let io = TokioIo::new(stream);
+    let service = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+        let query = Arc::clone(&query);
+        let config = Arc::clone(&config);
+
+        async move {
+            let method = req.method().clone();
+            let uri = req.uri().clone();
+
+            // Read request body, enforcing a size limit and a timeout
+            let body_result = tokio::time::timeout(
+                REQUEST_BODY_TIMEOUT,
+                Limited::new(req.into_body(), MAX_BODY_SIZE).collect(),
+            )
+            .await;
+
+            let resp_result = match body_result {
+                Ok(Ok(collected)) => {
+                    handle_request(
+                        method,
+                        uri,
+                        collected.to_bytes(),
+                        query,
+                        Arc::clone(&config),
+                    )
+                    .await
+                }
+                // Inner Err by http_body_util::Limited, either a LengthLimitError or an error by the underlying body stream
+                Ok(Err(e)) if e.is::<LengthLimitError>() => Err(HttpError(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "Request body too large".to_string(),
+                )),
+                Ok(Err(e)) => Err(HttpError(StatusCode::BAD_REQUEST, e.to_string())),
+                // Outer Err by tokio::time::timeout()
+                Err(_) => Err(HttpError(
+                    StatusCode::REQUEST_TIMEOUT,
+                    "Request timeout".to_string(),
+                )),
+            };
+
+            let mut resp = resp_result.unwrap_or_else(|err| {
+                warn!("{:?}", err);
+                Response::builder()
+                    .status(err.0)
+                    .header("Content-Type", "text/plain")
+                    .body(Full::new(Bytes::from(err.1)))
+                    .unwrap()
+            });
+            if let Some(ref origins) = config.cors {
+                resp.headers_mut()
+                    .insert("Access-Control-Allow-Origin", origins.parse().unwrap());
+            }
+            Ok::<_, hyper::Error>(resp)
+        }
+    });
+
+    let conn = ServerBuilder::new()
+        .timer(TokioTimer::new())
+        .header_read_timeout(REQUEST_HEADER_TIMEOUT)
+        .serve_connection(io, service);
+    let conn = graceful.watch(conn);
+    tokio::spawn(async move {
+        if let Err(e) = conn.await {
+            debug!("connection error: {}", e);
+        }
+    });
+}
+
 #[tokio::main]
 async fn run_server(config: Arc<Config>, query: Arc<Query>, rx: oneshot::Receiver<()>) {
     let addr = &config.http_addr;
     let socket_file = &config.http_socket_file;
 
-    let config = Arc::clone(&config);
-    let query = Arc::clone(&query);
+    let graceful = GracefulShutdown::new();
+    let mut signal = pin!(async {
+        rx.await.ok();
+    });
 
-    let make_service_fn_inn = || {
-        let query = Arc::clone(&query);
-        let config = Arc::clone(&config);
-
-        async move {
-            Ok::<_, hyper::Error>(service_fn(move |req| {
-                let query = Arc::clone(&query);
-                let config = Arc::clone(&config);
-
-                async move {
-                    let method = req.method().clone();
-                    let uri = req.uri().clone();
-                    let body = hyper::body::to_bytes(req.into_body()).await?;
-
-                    let mut resp = handle_request(method, uri, body, &query, &config)
-                        .unwrap_or_else(|err| {
-                            warn!("{:?}", err);
-                            Response::builder()
-                                .status(err.0)
-                                .header("Content-Type", "text/plain")
-                                .body(Body::from(err.1))
-                                .unwrap()
-                        });
-                    if let Some(ref origins) = config.cors {
-                        resp.headers_mut()
-                            .insert("Access-Control-Allow-Origin", origins.parse().unwrap());
-                    }
-                    Ok::<_, hyper::Error>(resp)
-                }
-            }))
-        }
-    };
-
-    let server = match socket_file {
+    match socket_file {
         None => {
-            info!("REST server running on {}", addr);
-
             let socket = create_socket(&addr);
             socket.listen(511).expect("setting backlog failed");
+            socket
+                .set_nonblocking(true)
+                .expect("set_nonblocking failed");
+            let listener =
+                TcpListener::from_std(socket.into()).expect("TcpListener::from_std failed");
+            info!("REST server running on {}", addr);
 
-            Server::from_tcp(socket.into())
-                .expect("Server::from_tcp failed")
-                .serve(make_service_fn(move |_| make_service_fn_inn()))
-                .with_graceful_shutdown(async {
-                    rx.await.ok();
-                })
-                .await
+            loop {
+                tokio::select! {
+                    result = listener.accept() => {
+                        match result {
+                            Ok((stream, _)) => {
+                                stream.set_nodelay(true).expect("failed to set TCP_NODELAY");
+                                spawn_conn(stream, Arc::clone(&query), Arc::clone(&config),  &graceful);
+                            }
+                            Err(e) => warn!("accept error: {}", e),
+                        }
+                    }
+                    _ = &mut signal => break,
+                }
+            }
         }
         Some(path) => {
             if let Ok(meta) = fs::metadata(&path) {
@@ -539,20 +627,31 @@ async fn run_server(config: Arc<Config>, query: Arc<Query>, rx: oneshot::Receive
                 }
             }
 
+            let listener = UnixListener::bind(path).expect("UnixListener::bind failed");
             info!("REST server running on unix socket {}", path.display());
 
-            Server::bind_unix(path)
-                .expect("Server::bind_unix failed")
-                .serve(make_service_fn(move |_| make_service_fn_inn()))
-                .with_graceful_shutdown(async {
-                    rx.await.ok();
-                })
-                .await
+            loop {
+                tokio::select! {
+                    result = listener.accept() => {
+                        match result {
+                            Ok((stream, _)) => spawn_conn(stream, Arc::clone(&query), Arc::clone(&config),  &graceful),
+                            Err(e) => warn!("accept error: {}", e),
+                        }
+                    }
+                    _ = &mut signal => break,
+                }
+            }
         }
-    };
+    }
 
-    if let Err(e) = server {
-        eprintln!("server error: {}", e);
+    // Wait for all connections to shutdown gracefully
+    tokio::select! {
+        _ = graceful.shutdown() => {
+            debug!("all connections gracefully closed");
+        }
+        _ = tokio::time::sleep(time::Duration::from_secs(10)) => {
+            warn!("timed out waiting for connections to close");
+        }
     }
 }
 
@@ -579,13 +678,73 @@ impl Handle {
     }
 }
 
-fn handle_request(
+/// Whether `uri` addresses the block template endpoint, the one route handled on the async
+/// runtime rather than on the blocking pool (see `handle_request`). Matched exactly the way
+/// the router below matches it, so the two cannot drift apart.
+fn is_block_template_request(method: &Method, uri: &hyper::Uri) -> bool {
+    let mut path = uri.path().split('/').skip(1);
+    *method == Method::GET && path.next() == Some("block-template") && path.next().is_none()
+}
+
+/// Dispatch a request, keeping blocking work off the async worker threads.
+///
+/// Almost every handler is synchronous: it reads RocksDB, and some of them (transaction
+/// broadcast, package submission, and any lookup in `--lightmode`) make a blocking JSON-RPC
+/// call to the daemon. Running those directly on a Tokio worker lets a slow or unresponsive
+/// daemon park every worker the runtime has, at which point even fully in-memory endpoints
+/// such as `GET /blocks/tip/height` stop being served. Moving them to the blocking pool
+/// keeps the runtime free to answer everything else.
+///
+/// The block template endpoint is the exception: it is genuinely asynchronous (concurrent
+/// callers share one in-flight daemon fetch) and already does its own blocking work on the
+/// blocking pool, so it stays on the runtime.
+#[trace]
+async fn handle_request(
     method: Method,
     uri: hyper::Uri,
-    body: hyper::body::Bytes,
+    body: Bytes,
+    query: Arc<Query>,
+    config: Arc<Config>,
+) -> Result<Response<Full<Bytes>>, HttpError> {
+    if is_block_template_request(&method, &uri) {
+        return handle_block_template_request(&query, &config).await;
+    }
+
+    let path = uri.path().to_string();
+    tokio::task::spawn_blocking(move || handle_blocking_request(method, uri, body, &query, &config))
+        .await
+        .unwrap_or_else(|err| {
+            // The handler panicked or was cancelled; hyper still needs a response.
+            warn!("request handler for path='{}' failed: {}", path, err);
+            Err(HttpError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal server error".to_string(),
+            ))
+        })
+}
+
+async fn handle_block_template_request(
     query: &Query,
     config: &Config,
-) -> Result<Response<Body>, HttpError> {
+) -> Result<Response<Full<Bytes>>, HttpError> {
+    if !config.enable_mining_rest {
+        return Err(HttpError::forbidden(
+            "mining REST endpoints are disabled".to_string(),
+        ));
+    }
+    getblocktemplate_response(query.getblocktemplate().await)
+}
+
+/// The synchronous body of the router. Always invoked from the blocking pool by
+/// `handle_request`, never directly from an async worker thread.
+#[trace]
+fn handle_blocking_request(
+    method: Method,
+    uri: hyper::Uri,
+    body: Bytes,
+    query: &Query,
+    config: &Config,
+) -> Result<Response<Full<Bytes>>, HttpError> {
     // TODO it looks hyper does not have routing and query parsing :(
     let path: Vec<&str> = uri.path().split('/').skip(1).collect();
     let query_params = match uri.query() {
@@ -595,7 +754,7 @@ fn handle_request(
         None => HashMap::new(),
     };
 
-    info!("handle {:?} {:?}", method, uri);
+    debug!("handle {:?} {:?}", method, uri);
     match (
         &method,
         path.get(0),
@@ -673,7 +832,7 @@ fn handle_request(
                 .status(StatusCode::OK)
                 .header("Content-Type", "application/octet-stream")
                 .header("Cache-Control", format!("public, max-age={:}", TTL_LONG))
-                .body(Body::from(raw))
+                .body(Full::new(Bytes::from(raw)))
                 .unwrap())
         }
         (&Method::GET, Some(&"block"), Some(hash), Some(&"txid"), Some(index), None) => {
@@ -690,41 +849,36 @@ fn handle_request(
         }
         (&Method::GET, Some(&"block"), Some(hash), Some(&"txs"), start_index, None) => {
             let hash = BlockHash::from_str(hash)?;
-            let txids = query
+
+            // Add lightweight validation that block exists before fetching transactions,
+            // to avoid expensive lookups in case of invalid block hash
+            query
                 .chain()
-                .get_block_txids(&hash)
+                .get_block_header(&hash)
                 .ok_or_else(|| HttpError::not_found("Block not found".to_string()))?;
 
             let start_index = start_index
                 .map_or(0u32, |el| el.parse().unwrap_or(0))
                 .max(0u32) as usize;
-            if start_index >= txids.len() {
-                bail!(HttpError::not_found("start index out of range".to_string()));
-            } else if start_index % CHAIN_TXS_PER_PAGE != 0 {
-                bail!(HttpError::from(format!(
-                    "start index must be a multipication of {}",
-                    CHAIN_TXS_PER_PAGE
-                )));
-            }
 
-            // blockid_by_hash() only returns the BlockId for non-orphaned blocks,
-            // or None for orphaned
-            let confirmed_blockid = query.chain().blockid_by_hash(&hash);
+            ensure!(
+                start_index % CHAIN_TXS_PER_PAGE == 0,
+                "start index must be a multiple of {}",
+                CHAIN_TXS_PER_PAGE
+            );
 
-            let txs = txids
-                .iter()
-                .skip(start_index)
-                .take(CHAIN_TXS_PER_PAGE)
-                .map(|txid| {
-                    query
-                        .lookup_txn(&txid)
-                        .map(|tx| (tx, confirmed_blockid.clone()))
-                        .ok_or_else(|| "missing tx".to_string())
-                })
-                .collect::<Result<Vec<(Transaction, Option<BlockId>)>, _>>()?;
+            // The BlockId would not be available for stale blocks
+            let blockid = query.chain().blockid_by_hash(&hash);
 
-            // XXX orphraned blocks alway get TTL_SHORT
-            let ttl = ttl_by_depth(confirmed_blockid.map(|b| b.height), query);
+            let txs = query
+                .chain()
+                .get_block_txs(&hash, start_index, CHAIN_TXS_PER_PAGE)?
+                .into_iter()
+                .map(|tx| (tx, blockid))
+                .collect();
+
+            // XXX stale blocks alway get TTL_SHORT
+            let ttl = ttl_by_depth(blockid.map(|b| b.height), query);
 
             json_response(prepare_txs(txs, query, config), ttl)
         }
@@ -892,8 +1046,8 @@ fn handle_request(
                 .ok_or_else(|| HttpError::not_found("Transaction not found".to_string()))?;
 
             let (content_type, body) = match *out_type {
-                "raw" => ("application/octet-stream", Body::from(rawtx)),
-                "hex" => ("text/plain", Body::from(rawtx.to_lower_hex_string())),
+                "raw" => ("application/octet-stream", Bytes::from(rawtx)),
+                "hex" => ("text/plain", Bytes::from(rawtx.to_lower_hex_string())),
                 _ => unreachable!(),
             };
             let ttl = ttl_by_depth(query.get_tx_status(&hash).block_height, query);
@@ -902,7 +1056,7 @@ fn handle_request(
                 .status(StatusCode::OK)
                 .header("Content-Type", content_type)
                 .header("Cache-Control", format!("public, max-age={:}", ttl))
-                .body(body)
+                .body(Full::new(body))
                 .unwrap())
         }
         (&Method::GET, Some(&"tx"), Some(hash), Some(&"status"), None, None) => {
@@ -968,7 +1122,7 @@ fn handle_request(
                 .lookup_txn(&hash)
                 .ok_or_else(|| HttpError::not_found("Transaction not found".to_string()))?;
             let spends: Vec<SpendingValue> = query
-                .lookup_tx_spends(tx)
+                .lookup_tx_spends(&tx)
                 .into_iter()
                 .map(|spend| spend.map_or_else(SpendingValue::default, SpendingValue::from))
                 .collect();
@@ -987,10 +1141,65 @@ fn handle_request(
                     .ok_or_else(|| HttpError::from("Missing tx".to_string()))?,
                 _ => return http_message(StatusCode::METHOD_NOT_ALLOWED, "Invalid method", 0),
             };
-            let txid = query
-                .broadcast_raw(&txhex)
-                .map_err(|err| HttpError::from(err.description().to_string()))?;
+            let txid = query.broadcast_raw(&txhex)?;
             http_message(StatusCode::OK, txid.to_string(), 0)
+        }
+        (&Method::POST, Some(&"txs"), Some(&"package"), None, None, None) => {
+            let txhexes: Vec<String> =
+                serde_json::from_str(String::from_utf8(body.to_vec())?.as_str())?;
+
+            if txhexes.len() > 25 {
+                Result::Err(HttpError::from(
+                    "Exceeded maximum of 25 transactions".to_string(),
+                ))?
+            }
+
+            let maxfeerate = query_params
+                .get("maxfeerate")
+                .map(|s| {
+                    s.parse::<f64>()
+                        .map_err(|_| HttpError::from("Invalid maxfeerate".to_string()))
+                })
+                .transpose()?;
+
+            let maxburnamount = query_params
+                .get("maxburnamount")
+                .map(|s| {
+                    s.parse::<f64>()
+                        .map_err(|_| HttpError::from("Invalid maxburnamount".to_string()))
+                })
+                .transpose()?;
+
+            // pre-checks
+            txhexes.iter().enumerate().try_for_each(|(index, txhex)| {
+                // each transaction must be of reasonable size
+                // (more than 60 bytes, within 400kWU standardness limit)
+                if !(120..800_000).contains(&txhex.len()) {
+                    Result::Err(HttpError::from(format!(
+                        "Invalid transaction size for item {}",
+                        index
+                    )))
+                } else {
+                    // must be a valid hex string
+                    HexToBytesIter::new(txhex)
+                        .map_err(|_| {
+                            HttpError::from(format!("Invalid transaction hex for item {}", index))
+                        })?
+                        .filter(|r| r.is_err())
+                        .next()
+                        .transpose()
+                        .map_err(|_| {
+                            HttpError::from(format!("Invalid transaction hex for item {}", index))
+                        })
+                        .map(|_| ())
+                }
+            })?;
+
+            let result = query
+                .submit_package(txhexes, maxfeerate, maxburnamount)
+                .map_err(|err| HttpError::from(err.description().to_string()))?;
+
+            json_response(result, TTL_SHORT)
         }
 
         (&Method::GET, Some(&"mempool"), None, None, None, None) => {
@@ -1009,6 +1218,8 @@ fn handle_request(
             json_response(query.estimate_fee_map(), TTL_SHORT)
         }
 
+        // NOTE: `GET /block-template` is intercepted by `handle_request` before reaching
+        // here, because it is the only asynchronous handler. See `is_block_template_request`.
         #[cfg(feature = "liquid")]
         (&Method::GET, Some(&"assets"), Some(&"registry"), None, None, None) => {
             let start_index: usize = query_params
@@ -1031,7 +1242,7 @@ fn handle_request(
                 .header("Cache-Control", "no-store")
                 .header("Content-Type", "application/json")
                 .header("X-Total-Results", total_num.to_string())
-                .body(Body::from(serde_json::to_string(&assets)?))
+                .body(Full::new(Bytes::from(serde_json::to_string(&assets)?)))
                 .unwrap())
         }
 
@@ -1133,28 +1344,107 @@ fn handle_request(
     }
 }
 
-fn http_message<T>(status: StatusCode, message: T, ttl: u32) -> Result<Response<Body>, HttpError>
+fn http_message<T>(
+    status: StatusCode,
+    message: T,
+    ttl: u32,
+) -> Result<Response<Full<Bytes>>, HttpError>
 where
-    T: Into<Body>,
+    T: Into<Bytes>,
 {
     Ok(Response::builder()
         .status(status)
         .header("Content-Type", "text/plain")
         .header("Cache-Control", format!("public, max-age={:}", ttl))
-        .body(message.into())
+        .body(Full::new(message.into()))
         .unwrap())
 }
 
-fn json_response<T: Serialize>(value: T, ttl: u32) -> Result<Response<Body>, HttpError> {
+fn json_response<T: Serialize>(value: T, ttl: u32) -> Result<Response<Full<Bytes>>, HttpError> {
+    json_response_with_status(value, StatusCode::OK, ttl)
+}
+
+fn json_response_with_status<T: Serialize>(
+    value: T,
+    status: StatusCode,
+    ttl: u32,
+) -> Result<Response<Full<Bytes>>, HttpError> {
     let value = serde_json::to_string(&value)?;
     Ok(Response::builder()
+        .status(status)
         .header("Content-Type", "application/json")
         .header("Cache-Control", format!("public, max-age={:}", ttl))
-        .body(Body::from(value))
+        .body(Full::new(Bytes::from(value)))
         .unwrap())
 }
 
-fn blocks(query: &Query, start_height: Option<usize>) -> Result<Response<Body>, HttpError> {
+fn json_response_no_store<T: Serialize>(
+    value: T,
+    status: StatusCode,
+) -> Result<Response<Full<Bytes>>, HttpError> {
+    let value = serde_json::to_string(&value)?;
+    Ok(Response::builder()
+        .status(status)
+        .header("Content-Type", "application/json")
+        .header("Cache-Control", "no-store")
+        .body(Full::new(Bytes::from(value)))
+        .unwrap())
+}
+
+fn json_bytes_response_no_store(body: Bytes) -> Result<Response<Full<Bytes>>, HttpError> {
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "application/json")
+        .header("Cache-Control", "no-store")
+        .body(Full::new(body))
+        .unwrap())
+}
+
+fn text_response_no_store<T: Into<Bytes>>(
+    status: StatusCode,
+    message: T,
+) -> Result<Response<Full<Bytes>>, HttpError> {
+    Ok(Response::builder()
+        .status(status)
+        .header("Content-Type", "text/plain")
+        .header("Cache-Control", "no-store")
+        .body(Full::new(message.into()))
+        .unwrap())
+}
+
+fn getblocktemplate_response(
+    result: errors::Result<Bytes>,
+) -> Result<Response<Full<Bytes>>, HttpError> {
+    match result {
+        Ok(body) => json_bytes_response_no_store(body),
+        Err(err) => {
+            if let Some((code, message)) = getblocktemplate_rpc_error(&err) {
+                return json_response_no_store(
+                    json!({ "error": { "code": code, "message": message } }),
+                    StatusCode::BAD_GATEWAY,
+                );
+            }
+            if let errors::ErrorKind::Connection(message) = err.kind() {
+                return text_response_no_store(StatusCode::BAD_GATEWAY, message.clone());
+            }
+            text_response_no_store(StatusCode::BAD_GATEWAY, err.to_string())
+        }
+    }
+}
+
+fn getblocktemplate_rpc_error(err: &errors::Error) -> Option<(i64, String)> {
+    match err.kind() {
+        errors::ErrorKind::RpcError(code, message, method)
+            if method == "getblocktemplate" || method == "getnewblockhex" =>
+        {
+            Some((*code, message.clone()))
+        }
+        _ => None,
+    }
+}
+
+#[trace]
+fn blocks(query: &Query, start_height: Option<usize>) -> Result<Response<Full<Bytes>>, HttpError> {
     let mut values = Vec::new();
     let mut current_hash = match start_height {
         Some(height) => *query
@@ -1235,6 +1525,10 @@ impl HttpError {
     fn not_found(msg: String) -> Self {
         HttpError(StatusCode::NOT_FOUND, msg)
     }
+
+    fn forbidden(msg: String) -> Self {
+        HttpError(StatusCode::FORBIDDEN, msg)
+    }
 }
 
 impl From<String> for HttpError {
@@ -1266,15 +1560,29 @@ impl From<hex::HexToArrayError> for HttpError {
         HttpError::from("Invalid hex string".to_string())
     }
 }
-impl From<bitcoin::address::Error> for HttpError {
-    fn from(_e: bitcoin::address::Error) -> Self {
-        //HttpError::from(e.description().to_string())
-        HttpError::from("Invalid Bitcoin address".to_string())
-    }
-}
 impl From<errors::Error> for HttpError {
     fn from(e: errors::Error) -> Self {
         warn!("errors::Error: {:?}", e);
+        // Downstream daemon failures are ours, not the client's: answering them with the
+        // default 400 would tell callers (and caches, and load balancers) that a perfectly
+        // valid request was malformed.
+        match e.kind() {
+            // We refused to queue any deeper for the daemon. Retrying later may well work.
+            errors::ErrorKind::DaemonBusy(_) => {
+                return HttpError(StatusCode::SERVICE_UNAVAILABLE, e.to_string())
+            }
+            // The daemon could not be reached, or did not answer within the client-facing
+            // timeout (see DAEMON_PROXY_RPC_TIMEOUT).
+            errors::ErrorKind::DaemonUnavailable(_) => {
+                return HttpError(StatusCode::GATEWAY_TIMEOUT, e.to_string())
+            }
+            // -28 is bitcoind's "still warming up". Client-proxied requests are no longer
+            // retried until it finishes, so report it as a transient server-side condition.
+            errors::ErrorKind::RpcError(-28, _, _) => {
+                return HttpError(StatusCode::SERVICE_UNAVAILABLE, e.to_string())
+            }
+            _ => (),
+        }
         match e.description().to_string().as_ref() {
             "getblock RPC error: {\"code\":-5,\"message\":\"Block not found\"}" => {
                 HttpError::not_found("Block not found".to_string())
@@ -1315,9 +1623,61 @@ impl From<address::AddressError> for HttpError {
 
 #[cfg(test)]
 mod tests {
-    use crate::rest::HttpError;
+    use crate::rest::{is_block_template_request, HttpError};
+    use crate::{errors, errors::ErrorKind};
+    use http_body_util::BodyExt;
+    use hyper::{Method, StatusCode};
     use serde_json::Value;
     use std::collections::HashMap;
+
+    #[test]
+    fn block_template_is_the_only_route_kept_on_the_async_runtime() {
+        let is_async = |method: Method, uri: &str| {
+            is_block_template_request(&method, &uri.parse::<hyper::Uri>().unwrap())
+        };
+
+        assert!(is_async(Method::GET, "/block-template"));
+        assert!(is_async(Method::GET, "/block-template?ignored=1"));
+
+        // Everything else must fall through to the blocking pool, including near-misses
+        // that the router itself would not match as the block template route.
+        assert!(!is_async(Method::GET, "/block-template/"));
+        assert!(!is_async(Method::GET, "/block-template/extra"));
+        assert!(!is_async(Method::POST, "/block-template"));
+        assert!(!is_async(Method::GET, "/blocks/tip/height"));
+        assert!(!is_async(Method::POST, "/tx"));
+    }
+
+    #[test]
+    fn daemon_failures_map_to_gateway_statuses() {
+        // A client-proxied daemon failure is a downstream problem, so it must not be
+        // reported as a 400 (which would blame - and let caches memoize - a valid request).
+        let busy = HttpError::from(errors::Error::from(ErrorKind::DaemonBusy(
+            "all 8 client RPC slots are in use".to_string(),
+        )));
+        assert_eq!(busy.0, StatusCode::SERVICE_UNAVAILABLE);
+
+        let unavailable = HttpError::from(errors::Error::from(ErrorKind::DaemonUnavailable(
+            "sendrawtransaction failed".to_string(),
+        )));
+        assert_eq!(unavailable.0, StatusCode::GATEWAY_TIMEOUT);
+
+        // bitcoind still warming up: transient, and no longer retried for client requests.
+        let warming_up = HttpError::from(errors::Error::from(ErrorKind::RpcError(
+            -28,
+            "Loading block index...".to_string(),
+            "sendrawtransaction".to_string(),
+        )));
+        assert_eq!(warming_up.0, StatusCode::SERVICE_UNAVAILABLE);
+
+        // Unrelated daemon errors keep their existing 400 mapping.
+        let rejected = HttpError::from(errors::Error::from(ErrorKind::RpcError(
+            -26,
+            "min relay fee not met".to_string(),
+            "sendrawtransaction".to_string(),
+        )));
+        assert_eq!(rejected.0, StatusCode::BAD_REQUEST);
+    }
 
     #[test]
     fn test_parse_query_param() {
@@ -1379,5 +1739,93 @@ mod tests {
             .ok_or(HttpError::from("notexist absent or not a u64".to_string()));
 
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_getblocktemplate_rpc_error() {
+        let err: errors::Error = errors::ErrorKind::RpcError(
+            -8,
+            "getblocktemplate must be called with the segwit rule set".to_string(),
+            "getblocktemplate".to_string(),
+        )
+        .into();
+        assert_eq!(
+            super::getblocktemplate_rpc_error(&err),
+            Some((
+                -8,
+                "getblocktemplate must be called with the segwit rule set".to_string()
+            ))
+        );
+
+        let other_method: errors::Error =
+            errors::ErrorKind::RpcError(-5, "Block not found".to_string(), "getblock".to_string())
+                .into();
+        assert_eq!(super::getblocktemplate_rpc_error(&other_method), None);
+
+        let elements_err: errors::Error = errors::ErrorKind::RpcError(
+            -28,
+            "warming up".to_string(),
+            "getnewblockhex".to_string(),
+        )
+        .into();
+        assert_eq!(
+            super::getblocktemplate_rpc_error(&elements_err),
+            Some((-28, "warming up".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_getblocktemplate_response_no_store_errors() {
+        let warmup: errors::Error = errors::ErrorKind::RpcError(
+            -28,
+            "warming up".to_string(),
+            "getblocktemplate".to_string(),
+        )
+        .into();
+        let response = super::getblocktemplate_response(Err(warmup)).unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            response
+                .headers()
+                .get("cache-control")
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store")
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["code"].as_i64(), Some(-28));
+        assert_eq!(body["error"]["message"].as_str(), Some("warming up"));
+
+        let connection: errors::Error =
+            errors::ErrorKind::Connection("daemon unavailable".to_string()).into();
+        let response = super::getblocktemplate_response(Err(connection)).unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            response
+                .headers()
+                .get("cache-control")
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store")
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"daemon unavailable");
+
+        for message in [
+            "invalid getnewblockhex block hex",
+            "daemon returned a stale or competing block template twice",
+        ] {
+            let error: errors::Error = message.into();
+            let response = super::getblocktemplate_response(Err(error)).unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            assert_eq!(
+                response
+                    .headers()
+                    .get("cache-control")
+                    .and_then(|value| value.to_str().ok()),
+                Some("no-store")
+            );
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(&body[..], message.as_bytes());
+        }
     }
 }

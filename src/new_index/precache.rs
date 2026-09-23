@@ -3,16 +3,18 @@ use crate::errors::*;
 use crate::new_index::ChainQuery;
 use crate::util::FullHash;
 
-use crypto::digest::Digest;
-use crypto::sha2::Sha256;
 use rayon::prelude::*;
 
-use hex::FromHex;
+use bitcoin::hashes::{sha256, Hash};
+use bitcoin::hex::FromHex;
 use std::fs::File;
 use std::io;
 use std::io::prelude::*;
 use std::str::FromStr;
 
+use electrs_macros::trace;
+
+#[trace]
 pub fn precache(chain: &ChainQuery, scripthashes: Vec<FullHash>) {
     let total = scripthashes.len();
     info!("Pre-caching stats and utxo set for {} scripthashes", total);
@@ -36,6 +38,7 @@ pub fn precache(chain: &ChainQuery, scripthashes: Vec<FullHash>) {
     });
 }
 
+#[trace]
 pub fn scripthashes_from_file(path: String) -> Result<Vec<FullHash>> {
     let reader =
         io::BufReader::new(File::open(path).chain_err(|| "cannot open precache scripthash file")?);
@@ -70,9 +73,5 @@ fn address_to_scripthash(addr: &str) -> Result<FullHash> {
 }
 
 pub fn compute_script_hash(data: &[u8]) -> FullHash {
-    let mut hash = FullHash::default();
-    let mut sha2 = Sha256::new();
-    sha2.input(data);
-    sha2.result(&mut hash);
-    hash
+    sha256::Hash::hash(data).to_byte_array()
 }

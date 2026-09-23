@@ -3,7 +3,7 @@ use elements::{confidential::Asset, PeginData, PegoutData, TxIn, TxOut};
 use crate::chain::{bitcoin_genesis_hash, BNetwork, Network};
 use crate::util::{FullHash, ScriptToAsm};
 
-pub fn get_pegin_data(txout: &TxIn, network: Network) -> Option<PeginData> {
+pub fn get_pegin_data(txout: &TxIn, network: Network) -> Option<PeginData<'_>> {
     let pegged_asset_id = network.pegged_asset()?;
     txout
         .pegin_data()
@@ -14,7 +14,7 @@ pub fn get_pegout_data(
     txout: &TxOut,
     network: Network,
     parent_network: BNetwork,
-) -> Option<PegoutData> {
+) -> Option<PegoutData<'_>> {
     let pegged_asset_id = network.pegged_asset()?;
     txout.pegout_data().filter(|pegout| {
         pegout.asset == Asset::Explicit(*pegged_asset_id)
@@ -52,7 +52,7 @@ impl PegoutValue {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct PeginInfo {
     pub txid: FullHash,
-    pub vin: u16,
+    pub vin: u32,
     pub value: u64,
 }
 
@@ -60,6 +60,6 @@ pub struct PeginInfo {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct PegoutInfo {
     pub txid: FullHash,
-    pub vout: u16,
+    pub vout: u32,
     pub value: u64,
 }

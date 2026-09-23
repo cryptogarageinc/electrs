@@ -1,10 +1,12 @@
 use clap::{App, Arg};
 use dirs::home_dir;
+use std::fmt;
 use std::fs;
 use std::net::SocketAddr;
 use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use stderrlog;
 
 use crate::chain::Network;
@@ -18,6 +20,33 @@ use bitcoin::Network as BNetwork;
 
 const ELECTRS_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+#[derive(Clone)]
+pub struct SensitiveAuth(String);
+
+impl SensitiveAuth {
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+}
+
+impl fmt::Debug for SensitiveAuth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let username = self
+            .0
+            .split_once(':')
+            .map(|(username, _)| username)
+            .unwrap_or("<invalid>");
+        f.debug_tuple("UserPass")
+            .field(&username)
+            .field(&"<sensitive>")
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     // See below for the documentation of each field:
@@ -28,8 +57,13 @@ pub struct Config {
     pub daemon_dir: PathBuf,
     pub blocks_dir: PathBuf,
     pub daemon_rpc_addr: SocketAddr,
-    pub cookie: Option<String>,
+    pub daemon_rpc_fallback_addr: Option<SocketAddr>,
+    pub daemon_parallelism: usize,
+    pub daemon_conn_max_age: Option<Duration>,
+    pub cookie: Option<SensitiveAuth>,
     pub electrum_rpc_addr: SocketAddr,
+    pub electrum_rpc_conn_max_age: Option<Duration>,
+    pub electrum_rpc_max_request_num_bytes: usize,
     pub http_addr: SocketAddr,
     pub http_socket_file: Option<PathBuf>,
     pub monitoring_addr: SocketAddr,
@@ -39,18 +73,50 @@ pub struct Config {
     pub address_search: bool,
     pub index_unspendables: bool,
     pub ignore_check_initialblockdownload: bool,
+    pub enable_mining_rest: bool,
     pub cors: Option<String>,
     pub precache_scripts: Option<String>,
     pub utxos_limit: usize,
     pub electrum_txs_limit: usize,
+    pub electrum_subscription_limit: usize,
+    pub electrum_checkpoint_proof_concurrency_limit: usize,
     pub electrum_banner: String,
-    pub electrum_rpc_logging: Option<RpcLogging>,
+    pub rpc_logging: RpcLogging,
+    pub zmq_addr: Option<SocketAddr>,
 
-    /// Enable compaction during initial sync
-    ///
-    /// By default compaction is off until initial sync is finished for performance reasons,
-    /// however, this requires much more disk space.
-    pub initial_sync_compaction: bool,
+    /// RocksDB block cache size in MB (per database)
+    /// Caches decompressed data blocks, plus index and filter blocks (via cache_index_and_filter_blocks).
+    /// Total memory usage = cache_size * 3_databases (txstore, history, cache)
+    /// Recommendation: 1024 MB for steady-state; 4096 MB+ for initial sync (L0 SST
+    /// files accumulate up to the compaction trigger — their index, filter (Bloom),
+    /// and data blocks must fit in this cache). With 10 bits/key bloom filters and
+    /// a 512 MB write buffer, each L0 file's filter block is ~9.75 MB, so 64 L0
+    /// files need ~625 MB of filter blocks on top of index blocks.
+    pub db_block_cache_mb: usize,
+
+    /// RocksDB parallelism level (background compaction and flush threads)
+    /// Recommendation: Set to number of CPU cores for optimal performance
+    /// This configures max_background_jobs and thread pools automatically
+    pub db_parallelism: usize,
+
+    /// RocksDB write buffer size in MB (per database)
+    /// Each database uses this much RAM for in-memory writes before flushing to disk
+    /// Total RAM usage = write_buffer_size * max_write_buffer_number * 3_databases
+    /// Larger buffers = fewer flushes (less CPU) but more RAM usage
+    pub db_write_buffer_size_mb: usize,
+
+    /// Number of blocks per batch during initial sync (bitcoind fetch mode).
+    /// Larger batches keep more O rows in the write buffer when index() runs lookup_txos(),
+    /// improving cache hit rate for outputs spent within the same batch window.
+    /// Must stay within db_write_buffer_size_mb to avoid mid-batch flushes.
+    pub initial_sync_batch_size: usize,
+
+    /// Store index and filter blocks inside the block cache (default: false).
+    /// When enabled, bounds memory but allows eviction under pressure.
+    /// When disabled (default), index/filter blocks stay on the heap and are
+    /// may never be evicted, giving better read performance at the cost of ~18 MB
+    /// per SST file of unbounded memory.
+    pub db_cache_index_filter_blocks: bool,
 
     #[cfg(feature = "liquid")]
     pub parent_network: BNetwork,
@@ -77,10 +143,6 @@ fn str_to_socketaddr(address: &str, what: &str) -> SocketAddr {
 impl Config {
     pub fn from_args() -> Config {
         let network_help = format!("Select network type ({})", Network::names().join(", "));
-        let rpc_logging_help = format!(
-            "Select RPC logging option ({})",
-            RpcLogging::options().join(", ")
-        );
 
         let args = App::new("Electrum Rust Server")
             .version(crate_version!())
@@ -88,7 +150,7 @@ impl Config {
                 Arg::with_name("verbosity")
                     .short("v")
                     .multiple(true)
-                    .help("Increase logging verbosity"),
+                    .help("Increase logging verbosity (default: info, -v: debug, -vv: trace)"),
             )
             .arg(
                 Arg::with_name("timestamp")
@@ -148,25 +210,58 @@ impl Config {
             .arg(
                 Arg::with_name("electrum_rpc_addr")
                     .long("electrum-rpc-addr")
-                    .help("Electrum server JSONRPC 'addr:port' to listen on (default: '127.0.0.1:50001' for mainnet, '127.0.0.1:60001' for testnet and '127.0.0.1:60401' for regtest)")
+                    .help("Electrum server JSONRPC 'addr:port' to listen on (default: '127.0.0.1:50001' for mainnet, '127.0.0.1:60001' for testnet3, '127.0.0.1:40001' for testnet4 and '127.0.0.1:60401' for regtest)")
+                    .takes_value(true),
+            )
+            .arg(
+                Arg::with_name("electrum_rpc_conn_max_age")
+                    .long("electrum-rpc-conn-max-age")
+                    .help("Maximum age (in seconds) of inbound Electrum RPC TCP connections. Each connection is closed at a randomly selected age between 50% and 100% of this value so clients reconnect gradually and load balancers can redistribute them. 0 = unlimited / never disconnect (default)")
+                    .default_value("0")
+                    .takes_value(true),
+            )
+            .arg(
+                Arg::with_name("electrum_rpc_max_request_num_bytes")
+                    .long("electrum-rpc-max-request-num-bytes")
+                    .help("Maximum size (in bytes) of a single Electrum RPC request line. A client streaming bytes without a newline is disconnected once its in-flight line exceeds this size, bounding per-connection memory. 0 = unlimited (default: 1048576, i.e. 1 MiB)")
+                    .default_value("1048576")
                     .takes_value(true),
             )
             .arg(
                 Arg::with_name("http_addr")
                     .long("http-addr")
-                    .help("HTTP server 'addr:port' to listen on (default: '127.0.0.1:3000' for mainnet, '127.0.0.1:3001' for testnet and '127.0.0.1:3002' for regtest)")
+                    .help("HTTP server 'addr:port' to listen on (default: '127.0.0.1:3000' for mainnet, '127.0.0.1:3001' for testnet3 and '127.0.0.1:3004' for testnet4 and '127.0.0.1:3002' for regtest)")
                     .takes_value(true),
             )
             .arg(
                 Arg::with_name("daemon_rpc_addr")
                     .long("daemon-rpc-addr")
-                    .help("Bitcoin daemon JSONRPC 'addr:port' to connect (default: 127.0.0.1:8332 for mainnet, 127.0.0.1:18332 for testnet and 127.0.0.1:18443 for regtest)")
+                    .help("Bitcoin daemon JSONRPC 'addr:port' to connect (default: 127.0.0.1:8332 for mainnet, 127.0.0.1:18332 for testnet3 and 127.0.0.1:48332 for testnet4 and 127.0.0.1:18443 for regtest)")
+                    .takes_value(true),
+            )
+            .arg(
+                Arg::with_name("daemon_rpc_fallback_addr")
+                    .long("daemon-rpc-fallback-addr")
+                    .help("Fallback Bitcoin daemon JSONRPC 'addr:port' to connect if the primary fails")
+                    .takes_value(true),
+            )
+            .arg(
+                Arg::with_name("daemon_parallelism")
+                    .long("daemon-parallelism")
+                    .help("Number of JSONRPC requests to send in parallel")
+                    .default_value("4")
+            )
+            .arg(
+                Arg::with_name("daemon_rpc_conn_max_age")
+                    .long("daemon-rpc-conn-max-age")
+                    .help("Max age (in seconds) of a daemon RPC TCP connection before it is proactively recycled. Recycling re-establishes the connection, letting a load balancer (e.g. a Kubernetes ClusterSetIP) re-select a backend after node rotations. The reconnect happens inline on the next request, so prefer a generous value (minutes, not seconds) to avoid periodic latency spikes. 0 = unlimited / never recycle (default)")
+                    .default_value("0")
                     .takes_value(true),
             )
             .arg(
                 Arg::with_name("monitoring_addr")
                     .long("monitoring-addr")
-                    .help("Prometheus monitoring 'addr:port' to listen on (default: 127.0.0.1:4224 for mainnet, 127.0.0.1:14224 for testnet and 127.0.0.1:24224 for regtest)")
+                    .help("Prometheus monitoring 'addr:port' to listen on (default: 127.0.0.1:4224 for mainnet, 127.0.0.1:14224 for testnet3 and 127.0.0.1:44224 for testnet4 and 127.0.0.1:24224 for regtest)")
                     .takes_value(true),
             )
             .arg(
@@ -195,6 +290,11 @@ impl Config {
                     .help("Enable ignore checking initialblockdownload")
             )
             .arg(
+                Arg::with_name("enable_mining_rest")
+                    .long("enable-mining-rest")
+                    .help("Enable cached mining-related HTTP endpoints")
+            )
+            .arg(
                 Arg::with_name("cors")
                     .long("cors")
                     .help("Origins allowed to make cross-site requests")
@@ -218,19 +318,70 @@ impl Config {
                     .help("Maximum number of transactions returned by Electrum history queries. Lookups with more results will fail.")
                     .default_value("500")
             ).arg(
+                Arg::with_name("electrum_subscription_limit")
+                    .long("electrum-subscription-limit")
+                    .help("Maximum number of scripthash subscriptions a single Electrum connection may hold. Every subscription costs a history lookup on each new block, so an unbounded count lets one client impose unbounded recurring work. Re-subscribing to an already-tracked scripthash is always allowed. 0 = unlimited.")
+                    .default_value("10000")
+                    .takes_value(true)
+            ).arg(
+                Arg::with_name("electrum_checkpoint_proof_concurrency_limit")
+                    .long("electrum-checkpoint-proof-concurrency-limit")
+                    .help("Maximum number of blockchain.block.header(s) checkpoint Merkle proof builds (triggered by a non-zero cp_height) allowed to run at once, process-wide. Each build hashes every header from genesis up to cp_height, so an unbounded count lets concurrent cheap requests pin every CPU core. Requests past the cap fail immediately rather than queueing. 0 = reject all such requests.")
+                    .default_value("2")
+                    .takes_value(true)
+            ).arg(
                 Arg::with_name("electrum_banner")
                     .long("electrum-banner")
                     .help("Welcome banner for the Electrum server, shown in the console to clients.")
                     .takes_value(true)
             ).arg(
-                Arg::with_name("electrum_rpc_logging")
-                    .long("electrum-rpc-logging")
-                    .help(&rpc_logging_help)
-                    .takes_value(true),
+                Arg::with_name("enable_json_rpc_logging")
+                    .long("enable-json-rpc-logging")
+                    .help("turns on rpc logging")
+                    .takes_value(false)
             ).arg(
-                Arg::with_name("initial_sync_compaction")
-                    .long("initial-sync-compaction")
-                    .help("Perform compaction during initial sync (slower but less disk space required)")
+                Arg::with_name("hide_json_rpc_logging_parameters")
+                    .long("hide-json-rpc-logging-parameters")
+                    .help("disables parameter printing in rpc logs")
+                    .takes_value(false)
+            ).arg(
+                Arg::with_name("anonymize_json_rpc_logging_source_ip")
+                    .long("anonymize-json-rpc-logging-source-ip")
+                    .help("enables ip anonymization in rpc logs")
+                    .takes_value(false)
+            ).arg(
+                Arg::with_name("db_block_cache_mb")
+                    .long("db-block-cache-mb")
+                    .help("RocksDB block cache size in MB (shared across all databases). Bounds index/filter block memory; use 4096+ for initial sync to avoid table-reader heap growth.")
+                    .takes_value(true)
+                    .default_value("24")
+            ).arg(
+                Arg::with_name("db_parallelism")
+                    .long("db-parallelism")
+                    .help("RocksDB parallelism level. Set to number of CPU cores for optimal performance")
+                    .takes_value(true)
+                    .default_value("2")
+            ).arg(
+                Arg::with_name("db_write_buffer_size_mb")
+                    .long("db-write-buffer-size-mb")
+                    .help("RocksDB write buffer size in MB per database. RAM usage = size * max_write_buffers(2) * 3_databases")
+                    .takes_value(true)
+                    .default_value("256")
+             ).arg(
+                Arg::with_name("initial_sync_batch_size")
+                    .long("initial-sync-batch-size")
+                    .help("Number of blocks per batch during initial sync. Larger values keep more txo rows in the write buffer during indexing, improving lookup_txos cache hit rate for recently-created outputs.")
+                    .takes_value(true)
+                    .default_value("250")
+             ).arg(
+                Arg::with_name("cache_index_filter_blocks")
+                    .long("cache-index-filter-blocks")
+                    .help("Store index/filter blocks in the block cache instead of on the heap. Bounds memory but allows eviction under cache pressure.")
+             ).arg(
+                Arg::with_name("zmq_addr")
+                    .long("zmq-addr")
+                    .help("Optional zmq socket address of the bitcoind daemon")
+                    .takes_value(true),
             );
 
         #[cfg(unix)]
@@ -260,7 +411,7 @@ impl Config {
         let args = args.arg(
                 Arg::with_name("electrum_public_hosts")
                     .long("electrum-public-hosts")
-                    .help("A dictionary of hosts where the Electrum server can be reached at. Required to enable server discovery. See https://electrumx.readthedocs.io/en/latest/protocol-methods.html#server-features")
+                    .help("A dictionary of hosts where the Electrum server can be reached at. Required to enable server discovery. See https://electrum-protocol.readthedocs.io/en/latest/protocol-methods.html#server-features")
                     .takes_value(true)
             ).arg(
                 Arg::with_name("electrum_announce")
@@ -299,6 +450,8 @@ impl Config {
             #[cfg(not(feature = "liquid"))]
             Network::Testnet => 18332,
             #[cfg(not(feature = "liquid"))]
+            Network::Testnet4 => 48332,
+            #[cfg(not(feature = "liquid"))]
             Network::Regtest => 18443,
             #[cfg(not(feature = "liquid"))]
             Network::Signet => 38332,
@@ -313,6 +466,8 @@ impl Config {
             Network::Bitcoin => 50001,
             #[cfg(not(feature = "liquid"))]
             Network::Testnet => 60001,
+            #[cfg(not(feature = "liquid"))]
+            Network::Testnet4 => 40001,
             #[cfg(not(feature = "liquid"))]
             Network::Regtest => 60401,
             #[cfg(not(feature = "liquid"))]
@@ -331,6 +486,8 @@ impl Config {
             #[cfg(not(feature = "liquid"))]
             Network::Testnet => 3001,
             #[cfg(not(feature = "liquid"))]
+            Network::Testnet4 => 3004,
+            #[cfg(not(feature = "liquid"))]
             Network::Regtest => 3002,
             #[cfg(not(feature = "liquid"))]
             Network::Signet => 3003,
@@ -347,6 +504,8 @@ impl Config {
             Network::Bitcoin => 4224,
             #[cfg(not(feature = "liquid"))]
             Network::Testnet => 14224,
+            #[cfg(not(feature = "liquid"))]
+            Network::Testnet4 => 44224,
             #[cfg(not(feature = "liquid"))]
             Network::Regtest => 24224,
             #[cfg(not(feature = "liquid"))]
@@ -365,16 +524,39 @@ impl Config {
                 .unwrap_or(&format!("127.0.0.1:{}", default_daemon_port)),
             "Bitcoin RPC",
         );
+        let daemon_rpc_fallback_addr: Option<SocketAddr> = m
+            .value_of("daemon_rpc_fallback_addr")
+            .map(|e| str_to_socketaddr(e, "Bitcoin Fallback RPC"));
+
+        let daemon_conn_max_age: Option<Duration> =
+            match value_t_or_exit!(m, "daemon_rpc_conn_max_age", u64) {
+                0 => None, // 0 = unlimited / never recycle
+                secs => Some(Duration::from_secs(secs)),
+            };
+
         let electrum_rpc_addr: SocketAddr = str_to_socketaddr(
             m.value_of("electrum_rpc_addr")
                 .unwrap_or(&format!("127.0.0.1:{}", default_electrum_port)),
             "Electrum RPC",
         );
+        let electrum_rpc_conn_max_age: Option<Duration> =
+            match value_t_or_exit!(m, "electrum_rpc_conn_max_age", u64) {
+                0 => None, // 0 = unlimited / never disconnect
+                secs => Some(Duration::from_secs(secs)),
+            };
+        let electrum_rpc_max_request_num_bytes: usize =
+            match value_t_or_exit!(m, "electrum_rpc_max_request_num_bytes", usize) {
+                0 => usize::MAX, // 0 = unlimited
+                bytes => bytes,
+            };
         let http_addr: SocketAddr = str_to_socketaddr(
             m.value_of("http_addr")
                 .unwrap_or(&format!("127.0.0.1:{}", default_http_port)),
             "HTTP Server",
         );
+        let zmq_addr: Option<SocketAddr> = m
+            .value_of("zmq_addr")
+            .map(|e| str_to_socketaddr(e, "ZMQ addr"));
 
         let http_socket_file: Option<PathBuf> = m.value_of("http_socket_file").map(PathBuf::from);
         let monitoring_addr: SocketAddr = str_to_socketaddr(
@@ -399,7 +581,9 @@ impl Config {
             .value_of("blocks_dir")
             .map(PathBuf::from)
             .unwrap_or_else(|| daemon_dir.join("blocks"));
-        let cookie = m.value_of("cookie").map(|s| s.to_owned());
+        let cookie = m
+            .value_of("cookie")
+            .map(|s| SensitiveAuth::new(s.to_owned()));
 
         let electrum_banner = m.value_of("electrum_banner").map_or_else(
             || format!("Welcome to electrs-esplora {}", ELECTRS_VERSION),
@@ -413,11 +597,13 @@ impl Config {
 
         let mut log = stderrlog::new();
         let mut json_log = JsonLogger::new();
+        // Base verbosity is 2 (Info), each -v flag adds one level:
+        // no flags = Info, -v = Debug, -vv = Trace
         if m.is_present("json_log") {
-            json_log.verbosity(m.occurrences_of("verbosity") as usize);
+            json_log.verbosity(2 + m.occurrences_of("verbosity") as usize);
             json_log.init().expect("logging initialization failed");
         } else {
-            log.verbosity(m.occurrences_of("verbosity") as usize);
+            log.verbosity(2 + m.occurrences_of("verbosity") as usize);
             log.timestamp(if m.is_present("timestamp") {
                 stderrlog::Timestamp::Millisecond
             } else {
@@ -433,14 +619,31 @@ impl Config {
             daemon_dir,
             blocks_dir,
             daemon_rpc_addr,
+            daemon_rpc_fallback_addr,
+            daemon_parallelism: value_t_or_exit!(m, "daemon_parallelism", usize),
+            daemon_conn_max_age,
             cookie,
             utxos_limit: value_t_or_exit!(m, "utxos_limit", usize),
             electrum_rpc_addr,
+            electrum_rpc_conn_max_age,
+            electrum_rpc_max_request_num_bytes,
             electrum_txs_limit: value_t_or_exit!(m, "electrum_txs_limit", usize),
+            electrum_subscription_limit: value_t_or_exit!(m, "electrum_subscription_limit", usize),
+            electrum_checkpoint_proof_concurrency_limit: value_t_or_exit!(
+                m,
+                "electrum_checkpoint_proof_concurrency_limit",
+                usize
+            ),
             electrum_banner,
-            electrum_rpc_logging: m
-                .value_of("electrum_rpc_logging")
-                .map(|option| RpcLogging::from(option)),
+            rpc_logging: {
+                let params = RpcLogging {
+                    enabled: m.is_present("enable_json_rpc_logging"),
+                    hide_params: m.is_present("hide_json_rpc_logging_parameters"),
+                    anonymize_ip: m.is_present("anonymize_json_rpc_logging_source_ip"),
+                };
+                params.validate();
+                params
+            },
             http_addr,
             http_socket_file,
             monitoring_addr,
@@ -450,9 +653,15 @@ impl Config {
             address_search: m.is_present("address_search"),
             index_unspendables: m.is_present("index_unspendables"),
             ignore_check_initialblockdownload: m.is_present("ignore_check_initialblockdownload"),
+            enable_mining_rest: m.is_present("enable_mining_rest"),
             cors: m.value_of("cors").map(|s| s.to_string()),
             precache_scripts: m.value_of("precache_scripts").map(|s| s.to_string()),
-            initial_sync_compaction: m.is_present("initial_sync_compaction"),
+            db_block_cache_mb: value_t_or_exit!(m, "db_block_cache_mb", usize),
+            db_parallelism: value_t_or_exit!(m, "db_parallelism", usize),
+            db_write_buffer_size_mb: value_t_or_exit!(m, "db_write_buffer_size_mb", usize),
+            initial_sync_batch_size: value_t_or_exit!(m, "initial_sync_batch_size", usize),
+            db_cache_index_filter_blocks: m.is_present("cache_index_filter_blocks"),
+            zmq_addr,
 
             #[cfg(feature = "liquid")]
             parent_network,
@@ -467,9 +676,18 @@ impl Config {
             tor_proxy: m.value_of("tor_proxy").map(|s| s.parse().unwrap()),
         };
 
+        match &config.cookie {
+            Some(auth) => log::debug!("daemon authentication: {:?}", auth),
+            None => log::debug!(
+                "daemon authentication: CookieFile({:?})",
+                config.daemon_dir.join(".cookie")
+            ),
+        }
+
         let mut dump_info: Config = config.clone();
         if m.is_present("config_mask_password") {
-            dump_info.cookie = Some("********".to_string()); // for bitcoin rpc account & password
+            dump_info.cookie = Some(SensitiveAuth::new("********".to_string()));
+            // for bitcoin rpc account & password
         }
         if m.is_present("config_log_info") {
             info!("{:?}", dump_info)
@@ -492,25 +710,17 @@ impl Config {
     }
 }
 
-#[derive(Debug, Clone)]
-pub enum RpcLogging {
-    Full,
-    NoParams,
+#[derive(Debug, Default, Clone)]
+pub struct RpcLogging {
+    pub enabled: bool,
+    pub hide_params: bool,
+    pub anonymize_ip: bool,
 }
 
 impl RpcLogging {
-    pub fn options() -> Vec<String> {
-        return vec!["full".to_string(), "no-params".to_string()];
-    }
-}
-
-impl From<&str> for RpcLogging {
-    fn from(option: &str) -> Self {
-        match option {
-            "full" => RpcLogging::Full,
-            "no-params" => RpcLogging::NoParams,
-
-            _ => panic!("unsupported RPC logging option: {:?}", option),
+    pub fn validate(&self) {
+        if !self.enabled && (self.hide_params || self.anonymize_ip) {
+            panic!("Flags '--hide-json-rpc-logging-parameters' or '--anonymize-json-rpc-logging-source-ip' require '--enable-json-rpc-logging'");
         }
     }
 }
@@ -521,6 +731,8 @@ pub fn get_network_subdir(network: Network) -> Option<&'static str> {
         Network::Bitcoin => None,
         #[cfg(not(feature = "liquid"))]
         Network::Testnet => Some("testnet3"),
+        #[cfg(not(feature = "liquid"))]
+        Network::Testnet4 => Some("testnet4"),
         #[cfg(not(feature = "liquid"))]
         Network::Regtest => Some("regtest"),
         #[cfg(not(feature = "liquid"))]
@@ -556,5 +768,20 @@ impl CookieGetter for CookieFile {
             ErrorKind::Connection(format!("failed to read cookie from {:?}", path))
         })?;
         Ok(contents)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SensitiveAuth;
+
+    #[test]
+    fn sensitive_auth_debug_redacts_password() {
+        let password = "poc-PASSWORD-123";
+        let auth = SensitiveAuth::new(format!("poc-user:{}", password));
+        let rendered = format!("{:?}", auth);
+
+        assert_eq!(rendered, r#"UserPass("poc-user", "<sensitive>")"#);
+        assert!(!rendered.contains(password));
     }
 }

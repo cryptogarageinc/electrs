@@ -13,7 +13,7 @@ use crate::elements::registry::{AssetMeta, AssetRegistry};
 use crate::errors::*;
 use crate::new_index::schema::{TxHistoryInfo, TxHistoryKey, TxHistoryRow};
 use crate::new_index::{db::DBFlush, ChainQuery, DBRow, Mempool, Query};
-use crate::util::{bincode, full_hash, Bytes, FullHash, TransactionStatus, TxInput};
+use crate::util::{bincode, full_hash, BlockId, Bytes, FullHash, TransactionStatus, TxInput};
 
 lazy_static! {
     pub static ref NATIVE_ASSET_ID: AssetId =
@@ -74,9 +74,9 @@ pub struct IssuedAsset {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct AssetRow {
     pub issuance_txid: FullHash,
-    pub issuance_vin: u16,
+    pub issuance_vin: u32,
     pub prev_txid: FullHash,
-    pub prev_vout: u16,
+    pub prev_vout: u32,
     pub issuance: Bytes, // bincode does not like dealing with AssetIssuance, deserialization fails with "invalid type: sequence, expected a struct"
     pub reissuance_token: FullHash,
 }
@@ -108,7 +108,7 @@ impl IssuedAsset {
             },
             issuance_prevout: OutPoint {
                 txid: deserialize(&asset.prev_txid).unwrap(),
-                vout: asset.prev_vout as u32,
+                vout: asset.prev_vout,
             },
             contract_hash,
             reissuance_token,
@@ -157,7 +157,7 @@ impl LiquidAsset {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct IssuingInfo {
     pub txid: FullHash,
-    pub vin: u16,
+    pub vin: u32,
     pub is_reissuance: bool,
     // None for blinded issuances
     pub issued_amount: Option<u64>,
@@ -167,7 +167,7 @@ pub struct IssuingInfo {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct BurningInfo {
     pub txid: FullHash,
-    pub vout: u16,
+    pub vout: u32,
     pub value: u64,
 }
 
@@ -251,7 +251,7 @@ fn index_tx_assets(
                 pegout.asset.explicit().unwrap(),
                 TxHistoryInfo::Pegout(PegoutInfo {
                     txid,
-                    vout: txo_index as u16,
+                    vout: txo_index as u32,
                     value: pegout.value,
                 }),
             ));
@@ -262,7 +262,7 @@ fn index_tx_assets(
                         asset_id,
                         TxHistoryInfo::Burning(BurningInfo {
                             txid,
-                            vout: txo_index as u16,
+                            vout: txo_index as u32,
                             value: value,
                         }),
                     ));
@@ -277,7 +277,7 @@ fn index_tx_assets(
                 pegin.asset,
                 TxHistoryInfo::Pegin(PeginInfo {
                     txid,
-                    vin: txi_index as u16,
+                    vin: txi_index as u32,
                     value: pegin.value,
                 }),
             ));
@@ -302,7 +302,7 @@ fn index_tx_assets(
                 asset_id,
                 TxHistoryInfo::Issuing(IssuingInfo {
                     txid,
-                    vin: txi_index as u16,
+                    vin: txi_index as u32,
                     is_reissuance,
                     issued_amount,
                     token_amount,
@@ -321,9 +321,9 @@ fn index_tx_assets(
                     asset_id,
                     AssetRow {
                         issuance_txid: txid,
-                        issuance_vin: txi_index as u16,
+                        issuance_vin: txi_index as u32,
                         prev_txid: full_hash(&txi.previous_output.txid[..]),
-                        prev_vout: txi.previous_output.vout as u16,
+                        prev_vout: txi.previous_output.vout,
                         issuance: serialize(&txi.asset_issuance),
                         reissuance_token: full_hash(&reissuance_token.into_inner()[..]),
                     },
@@ -509,7 +509,7 @@ where
 
     // save updated stats to cache
     if let Some(lastblock) = lastblock {
-        chain.store().cache_db().write(
+        chain.store().cache_db().write_rows(
             vec![asset_cache_row(asset_id, &newstats, &lastblock)],
             DBFlush::Enable,
         );
@@ -526,13 +526,14 @@ fn chain_asset_stats_delta<T>(
     start_height: usize,
     apply_fn: AssetStatApplyFn<T>,
 ) -> (T, Option<BlockHash>) {
+    let headers = chain.store().headers();
     let history_iter = chain
         .history_iter_scan(b'I', &asset_id.into_inner()[..], start_height)
         .map(TxHistoryRow::from_row)
         .filter_map(|history| {
-            chain
-                .tx_confirming_block(&history.get_txid())
-                .map(|blockid| (history, blockid))
+            // skip over entries that point to non-existing heights (may happen while new/reorged blocks are being processed)
+            let header = headers.header_by_height(history.key.confirmed_height as usize)?;
+            Some((history, BlockId::from(header)))
         });
 
     let mut stats = init_stats;

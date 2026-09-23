@@ -1,24 +1,30 @@
+use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
-use std::env;
-use std::io::{BufRead, BufReader, Lines, Write};
+use std::convert::TryFrom;
+use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
+use std::{env, fs, io};
 
 use base64::prelude::{Engine, BASE64_STANDARD};
-use hex::FromHex;
-use itertools::Itertools;
+#[cfg(feature = "liquid")]
+use bitcoin::hex::FromHex;
+use error_chain::ChainedError;
+use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 use serde_json::{from_str, from_value, Value};
 
 #[cfg(not(feature = "liquid"))]
-use bitcoin::consensus::encode::{deserialize, serialize_hex};
+use bitcoin::consensus::encode::{deserialize_hex, serialize_hex};
 #[cfg(feature = "liquid")]
 use elements::encode::{deserialize, serialize_hex};
 
+use electrs_macros::trace;
+
 use crate::chain::{Block, BlockHash, BlockHeader, Network, Transaction, Txid};
-use crate::metrics::{HistogramOpts, HistogramVec, Metrics};
+use crate::metrics::{CounterVec, HistogramOpts, HistogramVec, MetricOpts, Metrics};
 use crate::signal::Waiter;
 use crate::util::{HeaderList, DEFAULT_BLOCKHASH};
 
@@ -34,8 +40,56 @@ lazy_static! {
     static ref DAEMON_WRITE_TIMEOUT: Duration = Duration::from_secs(
         env::var("DAEMON_WRITE_TIMEOUT").map_or(10 * 60, |s| s.parse().unwrap())
     );
+    // Minimum delay between *failed* proactive max-age recycle attempts, so that a sustained
+    // inability to open new connections doesn't make every request pay a connect timeout.
+    static ref DAEMON_CONN_RECYCLE_COOLDOWN: Duration = Duration::from_secs(
+        env::var("DAEMON_CONN_RECYCLE_COOLDOWN").map_or(30, |s| s.parse().unwrap())
+    );
+    // Maximum number of daemon RPCs made on behalf of API clients (transaction broadcast
+    // and package submission) that may be in flight at once. These endpoints are reachable
+    // anonymously, so this is what bounds how many threads a slow or wedged daemon can
+    // park. Kept well below bitcoind's own rpcthreads/rpcworkqueue so client traffic
+    // cannot starve the indexer of daemon capacity.
+    static ref DAEMON_PROXY_MAX_CONCURRENCY: usize =
+        env::var("DAEMON_PROXY_MAX_CONCURRENCY").map_or(8, |s| s.parse().unwrap());
+    // Read/write timeout for client-proxied RPCs. Deliberately far shorter than
+    // DAEMON_READ_TIMEOUT: an API client must get an answer (or a 504) in bounded time,
+    // whereas the indexer can afford to wait out a long-running daemon call.
+    static ref DAEMON_PROXY_RPC_TIMEOUT: Duration = Duration::from_secs(
+        env::var("DAEMON_PROXY_RPC_TIMEOUT").map_or(30, |s| s.parse().unwrap())
+    );
+    // How long a client-proxied RPC waits for a free slot before giving up with
+    // `DaemonBusy`, rather than queueing behind an unbounded backlog.
+    static ref DAEMON_PROXY_QUEUE_TIMEOUT: Duration = Duration::from_secs(
+        env::var("DAEMON_PROXY_QUEUE_TIMEOUT").map_or(5, |s| s.parse().unwrap())
+    );
+    // Caps on what a single daemon HTTP response may make us buffer. The RPC channel is
+    // plaintext with no server authentication, so the peer is only as trustworthy as the
+    // network path to it. Environment variables to match the timeouts above; these could
+    // equally be `--daemon-*` CLI flags if operators want them in `--help`.
+    //
+    // bitcoind's header lines are well under 200 bytes.
+    static ref DAEMON_MAX_HEADER_LINE_BYTES: usize =
+        env::var("DAEMON_MAX_HEADER_LINE_BYTES").map_or(8 * 1024, |s| s.parse().unwrap());
+    // Both a count and a byte cap, so neither many short headers nor a few long ones can
+    // grow the map without bound.
+    static ref DAEMON_MAX_HEADER_COUNT: usize =
+        env::var("DAEMON_MAX_HEADER_COUNT").map_or(100, |s| s.parse().unwrap());
+    static ref DAEMON_MAX_HEADER_TOTAL_BYTES: usize =
+        env::var("DAEMON_MAX_HEADER_TOTAL_BYTES").map_or(64 * 1024, |s| s.parse().unwrap());
+    // The largest legitimate reply is a `getblock` with verbose=false, which is hex and so
+    // roughly twice the block size (~8 MB for a maximal block), or a `getrawmempool` listing
+    // during heavy congestion (tens of MB). Requests are issued individually rather than
+    // JSON-RPC batched, so one response is never N blocks.
+    static ref DAEMON_MAX_BODY_BYTES: usize =
+        env::var("DAEMON_MAX_BODY_BYTES").map_or(128 * 1024 * 1024, |s| s.parse().unwrap());
 }
 
+const MAX_ATTEMPTS: u32 = 5;
+const RETRY_WAIT_DURATION: Duration = Duration::from_secs(1);
+const BLOCK_TEMPLATE_RPC_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[trace]
 fn parse_hash<T>(value: &Value) -> Result<T>
 where
     T: FromStr,
@@ -49,27 +103,35 @@ where
     .chain_err(|| format!("non-hex value: {}", value))?)
 }
 
+#[trace]
 fn header_from_value(value: Value) -> Result<BlockHeader> {
     let header_hex = value
         .as_str()
         .chain_err(|| format!("non-string header: {}", value))?;
-    let header_bytes = Vec::from_hex(header_hex).chain_err(|| "non-hex header")?;
-    Ok(
-        deserialize(&header_bytes)
-            .chain_err(|| format!("failed to parse header {}", header_hex))?,
-    )
+    deserialize_value(header_hex)
 }
 
 fn block_from_value(value: Value) -> Result<Block> {
     let block_hex = value.as_str().chain_err(|| "non-string block")?;
-    let block_bytes = Vec::from_hex(block_hex).chain_err(|| "non-hex block")?;
-    Ok(deserialize(&block_bytes).chain_err(|| format!("failed to parse block {}", block_hex))?)
+    deserialize_value(block_hex)
 }
 
 fn tx_from_value(value: Value) -> Result<Transaction> {
     let tx_hex = value.as_str().chain_err(|| "non-string tx")?;
-    let tx_bytes = Vec::from_hex(tx_hex).chain_err(|| "non-hex tx")?;
-    Ok(deserialize(&tx_bytes).chain_err(|| format!("failed to parse tx {}", tx_hex))?)
+    deserialize_value(tx_hex)
+}
+
+#[cfg(not(feature = "liquid"))]
+fn deserialize_value<T: bitcoin::consensus::Decodable>(hex: &str) -> Result<T> {
+    Ok(deserialize_hex(hex)
+        .chain_err(|| format!("failed to deserialize {}", std::any::type_name::<T>()))?)
+}
+
+#[cfg(feature = "liquid")]
+fn deserialize_value<T: elements::encode::Decodable>(hex: &str) -> Result<T> {
+    let bytes = Vec::from_hex(hex).chain_err(|| "invalid hex")?;
+    Ok(deserialize(&bytes)
+        .chain_err(|| format!("failed to deserialize {}", std::any::type_name::<T>()))?)
 }
 
 /// Parse JSONRPC error code, if exists.
@@ -79,14 +141,13 @@ fn parse_error_code(err: &Value) -> Option<i64> {
 
 fn parse_jsonrpc_reply(mut reply: Value, method: &str, expected_id: u64) -> Result<Value> {
     if let Some(reply_obj) = reply.as_object_mut() {
-        if let Some(err) = reply_obj.get("error") {
+        if let Some(err) = reply_obj.get_mut("error") {
             if !err.is_null() {
                 if let Some(code) = parse_error_code(&err) {
-                    match code {
-                        // RPC_IN_WARMUP -> retry by later reconnection
-                        -28 => bail!(ErrorKind::Connection(err.to_string())),
-                        _ => bail!("{} RPC error: {}", method, err),
-                    }
+                    let msg = err["message"]
+                        .as_str()
+                        .map_or_else(|| err.to_string(), |s| s.to_string());
+                    bail!(ErrorKind::RpcError(code, msg, method.to_string()))
                 }
             }
         }
@@ -128,31 +189,352 @@ struct NetworkInfo {
     relayfee: f64, // in BTC/kB
 }
 
+#[derive(Serialize, Deserialize, Debug)]
+struct MempoolFeesSubmitPackage {
+    base: f64,
+    #[serde(rename = "effective-feerate")]
+    effective_feerate: Option<f64>,
+    #[serde(rename = "effective-includes")]
+    effective_includes: Option<Vec<String>>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct SubmitPackageResult {
+    package_msg: String,
+    #[serde(rename = "tx-results")]
+    tx_results: HashMap<String, TxResult>,
+    #[serde(rename = "replaced-transactions")]
+    replaced_transactions: Option<Vec<String>>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct TxResult {
+    txid: String,
+    #[serde(rename = "other-wtxid")]
+    other_wtxid: Option<String>,
+    vsize: Option<u32>,
+    fees: Option<MempoolFeesSubmitPackage>,
+    error: Option<String>,
+}
+
+impl SubmitPackageResult {
+    /// Txids of the transactions accepted into the daemon's mempool by this package submission
+    /// (those without a per-transaction error).
+    pub fn accepted_txids(&self) -> Vec<Txid> {
+        self.tx_results
+            .values()
+            .filter(|tx| tx.error.is_none())
+            .filter_map(|tx| Txid::from_str(&tx.txid).ok())
+            .collect()
+    }
+
+    /// Build the response for the Electrum `blockchain.transaction.broadcast_package` method.
+    ///
+    /// When `verbose` is true, the full `submitpackage` result is returned. Otherwise a compact
+    /// `{ success, errors? }` object is returned, where `success` is whether the package was
+    /// accepted and `errors` lists any per-transaction errors.
+    ///
+    /// Ported from romanz/electrs (https://github.com/romanz/electrs).
+    pub fn into_electrum_response(self, verbose: bool) -> Value {
+        if verbose {
+            return json!(self);
+        }
+        let success = self.package_msg == "success";
+        let errors: Vec<Value> = self
+            .tx_results
+            .values()
+            .filter_map(|tx| {
+                tx.error
+                    .as_ref()
+                    .map(|error| json!({ "error": error, "txid": tx.txid }))
+            })
+            .collect();
+        if errors.is_empty() {
+            json!({ "success": success })
+        } else {
+            json!({ "success": success, "errors": errors })
+        }
+    }
+}
+
 pub trait CookieGetter: Send + Sync {
     fn get(&self) -> Result<Vec<u8>>;
 }
 
-struct Connection {
-    tx: TcpStream,
-    rx: Lines<BufReader<TcpStream>>,
-    cookie_getter: Arc<dyn CookieGetter>,
+#[derive(Clone)]
+struct ConnectionConfig {
     addr: SocketAddr,
+    fallback: Option<SocketAddr>,
+    cookie_getter: Arc<dyn CookieGetter>,
     signal: Waiter,
+    max_age: Option<Duration>,
 }
 
-fn tcp_connect(addr: SocketAddr, signal: &Waiter) -> Result<TcpStream> {
+impl ConnectionConfig {
+    fn connect(&self) -> Result<Connection> {
+        Connection::new(
+            self.addr,
+            self.fallback,
+            Arc::clone(&self.cookie_getter),
+            self.signal.clone(),
+            self.max_age,
+        )
+    }
+
+    fn connect_once(&self, io_timeout: Duration) -> Result<Connection> {
+        let (conn, active_addr) = tcp_connect_once(self.addr, self.fallback)?;
+        conn.set_read_timeout(Some(io_timeout))
+            .chain_err(|| "failed to configure one-shot daemon read timeout")?;
+        conn.set_write_timeout(Some(io_timeout))
+            .chain_err(|| "failed to configure one-shot daemon write timeout")?;
+        Connection::from_stream(
+            conn,
+            active_addr,
+            self.addr,
+            self.fallback,
+            Arc::clone(&self.cookie_getter),
+            self.signal.clone(),
+            None, // a one-shot connection never needs proactive recycling
+        )
+    }
+}
+
+struct Connection {
+    tx: TcpStream,
+    rx: BufReader<TcpStream>,
+    cookie_getter: Arc<dyn CookieGetter>,
+    addr: SocketAddr,
+    fallback: Option<SocketAddr>,
+    // The address this connection is actually established to: either `addr` (primary)
+    // or `fallback`. Used for accurate operational logging.
+    active_addr: SocketAddr,
+    signal: Waiter,
+    // When the TCP connection was (re)established, used together with `max_age` to
+    // proactively recycle long-lived connections (see `is_expired`).
+    established: Instant,
+    // Maximum age of a connection before it is proactively recycled, or None for unlimited.
+    max_age: Option<Duration>,
+    // When the last *failed* proactive recycle attempt happened, used to rate-limit retries
+    // (see `DAEMON_CONN_RECYCLE_COOLDOWN`). None until a recycle attempt fails.
+    last_recycle_attempt: Option<Instant>,
+    // Wall-clock budget for one whole `recv`, taken from the socket read timeout. That timeout
+    // only bounds a single read syscall, so a peer that keeps trickling bytes resets it
+    // indefinitely and pins the calling thread.
+    recv_budget: Duration,
+}
+
+fn configure_stream(conn: &TcpStream) {
+    // can only fail if DAEMON_TIMEOUT is 0
+    conn.set_read_timeout(Some(*DAEMON_READ_TIMEOUT)).unwrap();
+    conn.set_write_timeout(Some(*DAEMON_WRITE_TIMEOUT)).unwrap();
+}
+
+/// Shrink the socket read timeout to whatever is left of `deadline`, returning false once
+/// nothing is. Called before every blocking read: the socket timeout bounds one syscall, so
+/// checking the deadline only between reads lets a peer that sends a byte just before it
+/// expires buy itself another full timeout.
+fn arm_read_deadline(reader: &BufReader<TcpStream>, deadline: Instant) -> Result<bool> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Ok(false);
+    }
+    reader
+        .get_ref()
+        .set_read_timeout(Some(remaining))
+        .chain_err(|| ErrorKind::Connection("failed to arm the daemon read deadline".to_owned()))?;
+    Ok(true)
+}
+
+/// Read one `\n`-terminated line, refusing to buffer more than `max_len` bytes and giving
+/// up at `deadline`. Returns `Ok(None)` at a clean EOF before any bytes arrive.
+///
+/// The budget is checked before the buffer grows rather than after, so an oversized line is
+/// refused without ever being allocated. The trailing `\r\n` or `\n` is stripped.
+fn read_line_bounded(
+    reader: &mut BufReader<TcpStream>,
+    max_len: usize,
+    deadline: Instant,
+) -> Result<Option<String>> {
+    let mut raw: Vec<u8> = Vec::new();
     loop {
-        match TcpStream::connect_timeout(&addr, *DAEMON_CONNECTION_TIMEOUT) {
-            Ok(conn) => {
-                // can only fail if DAEMON_TIMEOUT is 0
-                conn.set_read_timeout(Some(*DAEMON_READ_TIMEOUT)).unwrap();
-                conn.set_write_timeout(Some(*DAEMON_WRITE_TIMEOUT)).unwrap();
-                return Ok(conn);
+        if !arm_read_deadline(reader, deadline)? {
+            bail!(ErrorKind::Connection(format!(
+                "daemon response deadline exceeded while reading a line bytes_read='{}'",
+                raw.len()
+            )));
+        }
+        let (chunk_len, done) = {
+            let available = match reader.fill_buf() {
+                Ok(buf) => buf,
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                // The armed timeout fired. Re-arm and retry: if that was the deadline the
+                // next pass reports it, and if time is left this was a short read.
+                Err(ref e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    continue
+                }
+                Err(e) => {
+                    return Err(e).chain_err(|| {
+                        ErrorKind::Connection("failed to read from daemon".to_owned())
+                    })
+                }
+            };
+            if available.is_empty() {
+                (0, true) // EOF
+            } else {
+                let (len, found_newline) = match available.iter().position(|&b| b == b'\n') {
+                    Some(i) => (i + 1, true),
+                    None => (available.len(), false),
+                };
+                if raw.len() + len > max_len {
+                    bail!(ErrorKind::Connection(format!(
+                        "daemon response line exceeds cap bytes='{}' max_bytes='{}'",
+                        raw.len() + len,
+                        max_len
+                    )));
+                }
+                raw.extend_from_slice(&available[..len]);
+                (len, found_newline)
             }
+        };
+        reader.consume(chunk_len);
+        if done {
+            if chunk_len == 0 && raw.is_empty() {
+                return Ok(None);
+            }
+            break;
+        }
+    }
+
+    if raw.last() == Some(&b'\n') {
+        raw.pop();
+    }
+    if raw.last() == Some(&b'\r') {
+        raw.pop();
+    }
+    String::from_utf8(raw)
+        .map(Some)
+        .chain_err(|| ErrorKind::Connection("daemon sent a non-UTF8 response line".to_owned()))
+}
+
+/// Read exactly `len` bytes, giving up at `deadline`. Returns short only on EOF, which the
+/// caller reports as a truncated response. `len` is the already-validated `Content-Length`,
+/// so the allocation is bounded by the cap rather than by what the peer chooses to send.
+fn read_body_bounded(
+    reader: &mut BufReader<TcpStream>,
+    len: usize,
+    deadline: Instant,
+) -> Result<Vec<u8>> {
+    // Grow into the buffer as bytes arrive rather than reserving `len` up front, so a large
+    // declared length that is never delivered costs nothing.
+    let mut body: Vec<u8> = Vec::with_capacity(len.min(64 * 1024));
+    while body.len() < len {
+        if !arm_read_deadline(reader, deadline)? {
+            bail!(ErrorKind::Connection(format!(
+                "daemon response deadline exceeded while reading the body bytes_read='{}' expected_bytes='{}'",
+                body.len(),
+                len
+            )));
+        }
+        let chunk_len = {
+            let available = match reader.fill_buf() {
+                Ok(buf) => buf,
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                // The armed timeout fired. Re-arm and retry: if that was the deadline the
+                // next pass reports it, and if time is left this was a short read.
+                Err(ref e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    continue
+                }
+                Err(e) => {
+                    return Err(e).chain_err(|| {
+                        ErrorKind::Connection("failed to read from daemon".to_owned())
+                    })
+                }
+            };
+            if available.is_empty() {
+                0 // EOF
+            } else {
+                let take = available.len().min(len - body.len());
+                body.extend_from_slice(&available[..take]);
+                take
+            }
+        };
+        if chunk_len == 0 {
+            break;
+        }
+        reader.consume(chunk_len);
+    }
+    Ok(body)
+}
+
+/// Attempt a single connection to the primary address, falling back to the fallback
+/// address once. Returns an error if neither is reachable. Does not retry or back off,
+/// so callers that must stay available (e.g. proactive max-age recycling) can give up
+/// and keep using their existing connection.
+#[trace]
+fn tcp_connect_once(
+    primary: SocketAddr,
+    fallback: Option<SocketAddr>,
+) -> Result<(TcpStream, SocketAddr)> {
+    let primary_err = match TcpStream::connect_timeout(&primary, *DAEMON_CONNECTION_TIMEOUT) {
+        Ok(conn) => {
+            configure_stream(&conn);
+            return Ok((conn, primary));
+        }
+        Err(err) => err,
+    };
+    // Return a single descriptive error and let the caller decide how to log it, rather than
+    // warning per-attempt here (which would double-log on the best-effort recycle path).
+    match fallback {
+        Some(fallback_addr) => {
+            debug!(
+                "primary daemon at {} unreachable ({}), trying fallback {}",
+                primary, primary_err, fallback_addr
+            );
+            match TcpStream::connect_timeout(&fallback_addr, *DAEMON_CONNECTION_TIMEOUT) {
+                Ok(conn) => {
+                    info!("connected to fallback daemon at {}", fallback_addr);
+                    configure_stream(&conn);
+                    Ok((conn, fallback_addr))
+                }
+                Err(fallback_err) => bail!(ErrorKind::Connection(format!(
+                    "failed to connect to primary daemon at {} ({}) and fallback at {} ({})",
+                    primary, primary_err, fallback_addr, fallback_err
+                ))),
+            }
+        }
+        None => bail!(ErrorKind::Connection(format!(
+            "failed to connect to daemon at {}: {}",
+            primary, primary_err
+        ))),
+    }
+}
+
+/// Connect to the daemon, retrying indefinitely (with backoff) until a connection
+/// succeeds. Used for startup and for reconnecting after a real send/recv failure,
+/// where there is no usable connection to fall back to.
+#[trace]
+fn tcp_connect(
+    primary: SocketAddr,
+    fallback: Option<SocketAddr>,
+    signal: &Waiter,
+) -> Result<(TcpStream, SocketAddr)> {
+    loop {
+        match tcp_connect_once(primary, fallback) {
+            Ok(res) => return Ok(res),
             Err(err) => {
                 warn!(
-                    "failed to connect daemon at {}: {} (backoff 3 seconds)",
-                    addr, err
+                    "{}; backoff 3 seconds before next attempt",
+                    err.display_chain()
                 );
                 signal.wait(Duration::from_secs(3), false)?;
                 continue;
@@ -161,30 +543,124 @@ fn tcp_connect(addr: SocketAddr, signal: &Waiter) -> Result<TcpStream> {
     }
 }
 
+/// Decide whether an expired connection is due for a (re)attempt at proactive recycling.
+/// Returns false when no max age is configured, when the connection is younger than the max
+/// age, or when a previous recycle attempt failed less than `cooldown` ago (to avoid paying a
+/// connect timeout on every request during a sustained connect failure). Pure for testability.
+fn recycle_due(
+    age: Duration,
+    max_age: Option<Duration>,
+    since_last_attempt: Option<Duration>,
+    cooldown: Duration,
+) -> bool {
+    match max_age {
+        None => false,
+        Some(max_age) => {
+            age >= max_age && since_last_attempt.map_or(true, |since| since >= cooldown)
+        }
+    }
+}
+
 impl Connection {
+    #[trace]
     fn new(
         addr: SocketAddr,
+        fallback: Option<SocketAddr>,
         cookie_getter: Arc<dyn CookieGetter>,
         signal: Waiter,
+        max_age: Option<Duration>,
     ) -> Result<Connection> {
-        let conn = tcp_connect(addr, &signal)?;
+        let (conn, active_addr) = tcp_connect(addr, fallback, &signal)?;
+        Connection::from_stream(
+            conn,
+            active_addr,
+            addr,
+            fallback,
+            cookie_getter,
+            signal,
+            max_age,
+        )
+    }
+
+    /// Build a `Connection` wrapper around an already-established TCP stream.
+    fn from_stream(
+        conn: TcpStream,
+        active_addr: SocketAddr,
+        addr: SocketAddr,
+        fallback: Option<SocketAddr>,
+        cookie_getter: Arc<dyn CookieGetter>,
+        signal: Waiter,
+        max_age: Option<Duration>,
+    ) -> Result<Connection> {
+        debug!("connected to bitcoind at {}", active_addr);
         let reader = BufReader::new(
             conn.try_clone()
                 .chain_err(|| format!("failed to clone {:?}", conn))?,
         );
+        // One-shot connections carry a much shorter timeout than the indexer's, so deriving
+        // the budget from the socket keeps each caller's existing latency expectations.
+        let recv_budget = conn
+            .read_timeout()
+            .ok()
+            .flatten()
+            .unwrap_or(*DAEMON_READ_TIMEOUT);
         Ok(Connection {
             tx: conn,
-            rx: reader.lines(),
+            rx: reader,
             cookie_getter,
             addr,
+            fallback,
+            active_addr,
             signal,
+            established: Instant::now(),
+            max_age,
+            last_recycle_attempt: None,
+            recv_budget,
         })
     }
 
+    #[trace]
     fn reconnect(&self) -> Result<Connection> {
-        Connection::new(self.addr, self.cookie_getter.clone(), self.signal.clone())
+        Connection::new(
+            self.addr,
+            self.fallback,
+            self.cookie_getter.clone(),
+            self.signal.clone(),
+            self.max_age,
+        )
     }
 
+    /// Attempt a single reconnect for proactive max-age recycling. Unlike `reconnect`,
+    /// this makes one bounded attempt (primary then fallback) and returns an error
+    /// instead of looping, so the caller can keep using the existing healthy connection
+    /// if no fresh socket is available.
+    #[trace]
+    fn try_reconnect_once(&self) -> Result<Connection> {
+        let (conn, active_addr) = tcp_connect_once(self.addr, self.fallback)?;
+        Connection::from_stream(
+            conn,
+            active_addr,
+            self.addr,
+            self.fallback,
+            self.cookie_getter.clone(),
+            self.signal.clone(),
+            self.max_age,
+        )
+    }
+
+    /// Whether this connection is due to be proactively recycled now: it has exceeded its
+    /// configured `max_age` and no recent recycle attempt has failed within the cooldown.
+    /// Always false when no max age is configured (unlimited).
+    fn should_recycle(&self) -> bool {
+        recycle_due(
+            self.established.elapsed(),
+            self.max_age,
+            self.last_recycle_attempt.map(|at| at.elapsed()),
+            *DAEMON_CONN_RECYCLE_COOLDOWN,
+        )
+    }
+
+    #[trace]
     fn send(&mut self, request: &str) -> Result<()> {
         let cookie = &self.cookie_getter.get()?;
         let msg = format!(
@@ -198,57 +674,102 @@ impl Connection {
         })
     }
 
+    #[trace]
     fn recv(&mut self) -> Result<String> {
+        // The read helpers shrink the socket timeout as the deadline approaches, so put it
+        // back on the way out and leave the socket as `configure_stream` set it.
+        let restore = self.rx.get_ref().read_timeout().ok().flatten();
+        let result = self.recv_within(Instant::now() + self.recv_budget);
+        let _ = self.rx.get_ref().set_read_timeout(restore);
+        result
+    }
+
+    fn recv_within(&mut self, deadline: Instant) -> Result<String> {
         // TODO: use proper HTTP parser.
-        let mut in_header = true;
-        let mut contents: Option<String> = None;
-        let iter = self.rx.by_ref();
-        let status = iter
-            .next()
+        let status = read_line_bounded(&mut self.rx, *DAEMON_MAX_HEADER_LINE_BYTES, deadline)?
             .chain_err(|| {
                 ErrorKind::Connection("disconnected from daemon while receiving".to_owned())
-            })?
-            .chain_err(|| ErrorKind::Connection("failed to read status".to_owned()))?;
+            })?;
+
         let mut headers = HashMap::new();
-        for line in iter {
-            let line = line.chain_err(|| ErrorKind::Connection("failed to read".to_owned()))?;
+        let mut header_count = 0usize;
+        let mut header_bytes = 0usize;
+        loop {
+            let line = read_line_bounded(&mut self.rx, *DAEMON_MAX_HEADER_LINE_BYTES, deadline)?
+                .chain_err(|| {
+                    ErrorKind::Connection(
+                        "disconnected from daemon while reading headers".to_owned(),
+                    )
+                })?;
             if line.is_empty() {
-                in_header = false; // next line should contain the actual response.
-            } else if in_header {
-                let parts: Vec<&str> = line.splitn(2, ": ").collect();
-                if parts.len() == 2 {
-                    headers.insert(parts[0].to_owned(), parts[1].to_owned());
-                } else {
-                    warn!("invalid header: {:?}", line);
-                }
+                break; // end of the header section, the body follows
+            }
+            header_count += 1;
+            header_bytes += line.len();
+            if header_count > *DAEMON_MAX_HEADER_COUNT {
+                bail!(ErrorKind::Connection(format!(
+                    "daemon sent too many response headers count='{}' max_count='{}'",
+                    header_count, *DAEMON_MAX_HEADER_COUNT
+                )));
+            }
+            if header_bytes > *DAEMON_MAX_HEADER_TOTAL_BYTES {
+                bail!(ErrorKind::Connection(format!(
+                    "daemon response headers exceed cap bytes='{}' max_bytes='{}'",
+                    header_bytes, *DAEMON_MAX_HEADER_TOTAL_BYTES
+                )));
+            }
+            let parts: Vec<&str> = line.splitn(2, ": ").collect();
+            if parts.len() == 2 {
+                headers.insert(parts[0].to_lowercase(), parts[1].to_owned());
             } else {
-                contents = Some(line);
-                break;
+                warn!("invalid header: {:?}", line);
             }
         }
 
-        let contents =
-            contents.chain_err(|| ErrorKind::Connection("no reply from daemon".to_owned()))?;
         let contents_length: &str = headers
-            .get("Content-Length")
+            .get("content-length")
             .chain_err(|| format!("Content-Length is missing: {:?}", headers))?;
         let contents_length: usize = contents_length
             .parse()
             .chain_err(|| format!("invalid Content-Length: {:?}", contents_length))?;
 
-        let expected_length = contents_length - 1; // trailing EOL is skipped
-        if expected_length != contents.len() {
+        // A zero length leaves no room for the trailing EOL that bitcoind always sends,
+        // so it cannot be a well-formed reply.
+        if contents_length == 0 {
+            bail!(ErrorKind::Connection(
+                "daemon sent an empty response body content_length='0'".to_owned()
+            ));
+        }
+        if contents_length > *DAEMON_MAX_BODY_BYTES {
             bail!(ErrorKind::Connection(format!(
-                "expected {} bytes, got {}",
-                expected_length,
-                contents.len()
+                "daemon response body exceeds cap content_length='{}' max_bytes='{}'",
+                contents_length, *DAEMON_MAX_BODY_BYTES
             )));
         }
+
+        let mut body = read_body_bounded(&mut self.rx, contents_length, deadline)?;
+        if body.len() != contents_length {
+            bail!(ErrorKind::Connection(format!(
+                "truncated daemon response expected_bytes='{}' got_bytes='{}'",
+                contents_length,
+                body.len()
+            )));
+        }
+        // Content-Length covers the trailing EOL, which is not part of the JSON payload.
+        if body.last() == Some(&b'\n') {
+            body.pop();
+        }
+        if body.last() == Some(&b'\r') {
+            body.pop();
+        }
+        let contents = String::from_utf8(body).chain_err(|| {
+            ErrorKind::Connection("daemon sent a non-UTF8 response body".to_owned())
+        })?;
 
         Ok(if status == "HTTP/1.1 200 OK" {
             contents
         } else if status == "HTTP/1.1 500 Internal Server Error" {
-            warn!("HTTP status: {}", status);
+            debug!("RPC HTTP 500 error: {}", contents);
             contents // the contents should have a JSONRPC error field
         } else {
             bail!(
@@ -258,6 +779,68 @@ impl Connection {
                 contents
             );
         })
+    }
+}
+
+/// A counting semaphore for blocking (non-async) callers, used to cap how many daemon RPCs
+/// may be in flight on behalf of API clients at any one time.
+///
+/// Client-triggered RPCs are anonymous and unmetered, so without a cap a caller can open as
+/// many concurrent daemon calls as it can open sockets. Each of those calls occupies a
+/// thread for as long as the daemon takes to answer, which is what turns a slow daemon into
+/// a full API outage. Bounding them means a slow daemon degrades the endpoints that need it
+/// and leaves every other endpoint untouched.
+struct BlockingSemaphore {
+    /// Number of permits still available.
+    available: Mutex<usize>,
+    released: Condvar,
+    capacity: usize,
+}
+
+impl BlockingSemaphore {
+    fn new(capacity: usize) -> Self {
+        // A zero capacity would deadlock every caller, so treat it as "one at a time".
+        let capacity = capacity.max(1);
+        BlockingSemaphore {
+            available: Mutex::new(capacity),
+            released: Condvar::new(),
+            capacity,
+        }
+    }
+
+    /// Take a permit, waiting at most `wait_timeout` for one to be released. Returns `None`
+    /// if none became available in time, so the caller can fail fast instead of queueing
+    /// behind an unbounded backlog of requests to an unresponsive daemon.
+    fn acquire(&self, wait_timeout: Duration) -> Option<SemaphorePermit<'_>> {
+        let deadline = Instant::now() + wait_timeout;
+        let mut available = self.available.lock().unwrap();
+        loop {
+            if *available > 0 {
+                *available -= 1;
+                return Some(SemaphorePermit { semaphore: self });
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            available = self.released.wait_timeout(available, remaining).unwrap().0;
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        self.capacity
+    }
+}
+
+/// Returns its permit to the [`BlockingSemaphore`] on drop.
+struct SemaphorePermit<'a> {
+    semaphore: &'a BlockingSemaphore,
+}
+
+impl Drop for SemaphorePermit<'_> {
+    fn drop(&mut self) {
+        *self.semaphore.available.lock().unwrap() += 1;
+        self.semaphore.released.notify_one();
     }
 }
 
@@ -283,13 +866,22 @@ pub struct Daemon {
     daemon_dir: PathBuf,
     blocks_dir: PathBuf,
     network: Network,
+    connection_config: ConnectionConfig,
     conn: Mutex<Connection>,
     message_id: Counter, // for monotonic JSONRPC 'id'
     signal: Waiter,
 
+    rpc_threads: Arc<rayon::ThreadPool>,
+
+    // Caps concurrent RPCs issued on behalf of API clients (see `request_proxied`).
+    // Shared across reconnects so the cap stays global to the process.
+    proxy_limit: Arc<BlockingSemaphore>,
+
     // monitoring
     latency: HistogramVec,
     size: HistogramVec,
+    conn_recycle: CounterVec,
+    proxy_rpc: CounterVec,
 }
 
 impl Daemon {
@@ -297,23 +889,39 @@ impl Daemon {
         daemon_dir: &PathBuf,
         blocks_dir: &PathBuf,
         daemon_rpc_addr: SocketAddr,
+        daemon_rpc_fallback_addr: Option<SocketAddr>,
+        daemon_parallelism: usize,
         cookie_getter: Arc<dyn CookieGetter>,
         network: Network,
         signal: Waiter,
         metrics: &Metrics,
         ignore_check_initialblockdownload: bool,
+        conn_max_age: Option<Duration>,
     ) -> Result<Daemon> {
+        let connection_config = ConnectionConfig {
+            addr: daemon_rpc_addr,
+            fallback: daemon_rpc_fallback_addr,
+            cookie_getter,
+            signal: signal.clone(),
+            max_age: conn_max_age,
+        };
+        let conn = connection_config.connect()?;
         let daemon = Daemon {
             daemon_dir: daemon_dir.clone(),
             blocks_dir: blocks_dir.clone(),
             network,
-            conn: Mutex::new(Connection::new(
-                daemon_rpc_addr,
-                cookie_getter,
-                signal.clone(),
-            )?),
+            connection_config,
+            conn: Mutex::new(conn),
             message_id: Counter::new(),
             signal: signal.clone(),
+            rpc_threads: Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(daemon_parallelism)
+                    .thread_name(|i| format!("rpc-requests-{}", i))
+                    .build()
+                    .unwrap(),
+            ),
+            proxy_limit: Arc::new(BlockingSemaphore::new(*DAEMON_PROXY_MAX_CONCURRENCY)),
             latency: metrics.histogram_vec(
                 HistogramOpts::new("daemon_rpc", "Bitcoind RPC latency (in seconds)"),
                 &["method"],
@@ -321,6 +929,20 @@ impl Daemon {
             size: metrics.histogram_vec(
                 HistogramOpts::new("daemon_bytes", "Bitcoind RPC size (in bytes)"),
                 &["method", "dir"],
+            ),
+            proxy_rpc: metrics.counter_vec(
+                MetricOpts::new(
+                    "daemon_rpc_proxied",
+                    "Daemon RPCs made on behalf of API clients (by result)",
+                ),
+                &["result"],
+            ),
+            conn_recycle: metrics.counter_vec(
+                MetricOpts::new(
+                    "daemon_rpc_conn_recycled",
+                    "Proactive daemon RPC connection recycle attempts (by result)",
+                ),
+                &["result"],
             ),
         };
         let network_info = daemon.getnetworkinfo()?;
@@ -357,19 +979,26 @@ impl Daemon {
         Ok(daemon)
     }
 
+    #[trace]
     pub fn reconnect(&self) -> Result<Daemon> {
         Ok(Daemon {
             daemon_dir: self.daemon_dir.clone(),
             blocks_dir: self.blocks_dir.clone(),
             network: self.network,
+            connection_config: self.connection_config.clone(),
             conn: Mutex::new(self.conn.lock().unwrap().reconnect()?),
             message_id: Counter::new(),
             signal: self.signal.clone(),
+            rpc_threads: self.rpc_threads.clone(),
+            proxy_limit: Arc::clone(&self.proxy_limit),
             latency: self.latency.clone(),
             size: self.size.clone(),
+            conn_recycle: self.conn_recycle.clone(),
+            proxy_rpc: self.proxy_rpc.clone(),
         })
     }
 
+    #[trace]
     pub fn list_blk_files(&self) -> Result<Vec<PathBuf>> {
         let path = self.blocks_dir.join("blk*.dat");
         debug!("listing block files at {:?}", path);
@@ -381,12 +1010,67 @@ impl Daemon {
         Ok(paths)
     }
 
+    /// bitcoind v28.0+ defaults to xor-ing all blk*.dat files with this key,
+    /// stored in the blocks dir.
+    /// See: <https://github.com/bitcoin/bitcoin/pull/28052>
+    pub fn read_blk_file_xor_key(&self) -> Result<Option<[u8; 8]>> {
+        // From: <https://github.com/bitcoin/bitcoin/blob/v28.0/src/node/blockstorage.cpp#L1160>
+        let path = self.blocks_dir.join("xor.dat");
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err).chain_err(|| "failed to read daemon xor.dat file"),
+        };
+        let xor_key: [u8; 8] = <[u8; 8]>::try_from(bytes.as_slice()).chain_err(|| {
+            format!(
+                "xor.dat unexpected length: actual: {}, expected: 8",
+                bytes.len()
+            )
+        })?;
+        Ok(Some(xor_key))
+    }
+
     pub fn magic(&self) -> u32 {
         self.network.magic()
     }
 
-    fn call_jsonrpc(&self, method: &str, request: &Value) -> Result<Value> {
-        let mut conn = self.conn.lock().unwrap();
+    #[trace]
+    fn call_jsonrpc_on_connection(
+        &self,
+        method: &str,
+        request: &Value,
+        conn: &mut Connection,
+    ) -> Result<Value> {
+        // Proactively recycle connections older than the configured max age. Re-establishing
+        // the TCP connection lets a fronting load balancer (e.g. a Kubernetes ClusterSetIP)
+        // re-select a backend, so a long-lived connection does not stay pinned to a stale
+        // endpoint after node rotations. No-op when no max age is configured (the default).
+        if conn.should_recycle() {
+            match conn.try_reconnect_once() {
+                Ok(new_conn) => {
+                    debug!(
+                        "recycled expired daemon RPC connection to {} after {:?}",
+                        conn.active_addr,
+                        conn.established.elapsed()
+                    );
+                    *conn = new_conn;
+                    self.conn_recycle.with_label_values(&["ok"]).inc();
+                }
+                Err(err) => {
+                    // Recycling is best-effort: if no fresh socket is available (e.g. a
+                    // transient load-balancer hiccup), keep using the existing healthy
+                    // connection rather than blocking requests while it is still usable.
+                    // Record the failed attempt so we don't retry (and pay a connect timeout)
+                    // on every subsequent request; the next attempt waits out the cooldown.
+                    conn.last_recycle_attempt = Some(Instant::now());
+                    self.conn_recycle.with_label_values(&["failed"]).inc();
+                    warn!(
+                        "failed recycling expired daemon RPC connection, keeping existing connection: {}",
+                        err.display_chain()
+                    );
+                }
+            }
+        }
         let timer = self.latency.with_label_values(&[method]).start_timer();
         let request = request.to_string();
         conn.send(&request)?;
@@ -402,33 +1086,32 @@ impl Daemon {
         Ok(result)
     }
 
-    fn handle_request_batch(&self, method: &str, params_list: &[Value]) -> Result<Vec<Value>> {
-        let id = self.message_id.next();
-        let chunks = params_list
-            .iter()
-            .map(|params| json!({"method": method, "params": params, "id": id}))
-            .chunks(50_000); // Max Amount of batched requests
-        let mut results = vec![];
-        for chunk in &chunks {
-            let reqs = chunk.collect();
-            let mut replies = self.call_jsonrpc(method, &reqs)?;
-            if let Some(replies_vec) = replies.as_array_mut() {
-                for reply in replies_vec {
-                    results.push(parse_jsonrpc_reply(reply.take(), method, id)?)
-                }
-            } else {
-                bail!("non-array replies: {:?}", replies);
-            }
-        }
-
-        Ok(results)
+    #[trace]
+    fn call_jsonrpc(&self, method: &str, request: &Value) -> Result<Value> {
+        let mut conn = self.conn.lock().unwrap();
+        self.call_jsonrpc_on_connection(method, request, &mut conn)
     }
 
-    fn retry_request_batch(&self, method: &str, params_list: &[Value]) -> Result<Vec<Value>> {
+    #[trace(method = %method)]
+    fn handle_request(&self, method: &str, params: &Value) -> Result<Value> {
+        let id = self.message_id.next();
+        let req = json!({"method": method, "params": params, "id": id});
+        let reply = self.call_jsonrpc(method, &req)?;
+        parse_jsonrpc_reply(reply, method, id)
+    }
+
+    fn retry_request(&self, method: &str, params: &Value) -> Result<Value> {
         loop {
-            match self.handle_request_batch(method, params_list) {
-                Err(Error(ErrorKind::Connection(msg), _)) => {
-                    warn!("reconnecting to bitcoind: {}", msg);
+            match self.handle_request(method, &params) {
+                Err(e @ Error(ErrorKind::Connection(_), _)) => {
+                    warn!("reconnecting to bitcoind: {}", e.display_chain());
+                    self.signal.wait(Duration::from_secs(3), false)?;
+                    let mut conn = self.conn.lock().unwrap();
+                    *conn = conn.reconnect()?;
+                    continue;
+                }
+                Err(e @ Error(ErrorKind::RpcError(-28, _, _), _)) => {
+                    warn!("bitcoind is warming up: {}", e.display_chain());
                     self.signal.wait(Duration::from_secs(3), false)?;
                     let mut conn = self.conn.lock().unwrap();
                     *conn = conn.reconnect()?;
@@ -439,50 +1122,163 @@ impl Daemon {
         }
     }
 
+    #[trace]
     fn request(&self, method: &str, params: Value) -> Result<Value> {
-        let mut values = self.retry_request_batch(method, &[params])?;
-        assert_eq!(values.len(), 1);
-        Ok(values.remove(0))
+        self.retry_request(method, &params)
     }
 
-    fn requests(&self, method: &str, params_list: &[Value]) -> Result<Vec<Value>> {
-        self.retry_request_batch(method, params_list)
+    /// Perform one RPC on a fresh connection isolated from singleton RPC users.
+    /// Connection and warmup failures are returned to the caller without retrying.
+    #[trace]
+    fn request_once(&self, method: &str, params: Value, io_timeout: Duration) -> Result<Value> {
+        let id = self.message_id.next();
+        let req = json!({"method": method, "params": params, "id": id});
+        let mut conn = self.connection_config.connect_once(io_timeout)?;
+        let reply = self.call_jsonrpc_on_connection(method, &req, &mut conn)?;
+        parse_jsonrpc_reply(reply, method, id)
+    }
+
+    /// Perform one RPC on behalf of an API client, bounded in both concurrency and time.
+    ///
+    /// The REST and Electrum endpoints that reach the daemon are anonymous and unmetered,
+    /// so they must not use `request`: that path serializes on the process-wide
+    /// `Mutex<Connection>` (letting one slow client request stall the indexer and every
+    /// other client) and retries transport failures forever (letting one client request
+    /// occupy a thread indefinitely). Instead each call gets its own short-lived
+    /// connection with a short I/O timeout, and `proxy_limit` caps how many may be in
+    /// flight at once. Failures are reported to the client rather than retried.
+    #[trace(method = %method)]
+    fn request_proxied(&self, method: &str, params: Value) -> Result<Value> {
+        let _permit = self
+            .proxy_limit
+            .acquire(*DAEMON_PROXY_QUEUE_TIMEOUT)
+            .ok_or_else(|| {
+                self.proxy_rpc.with_label_values(&["busy"]).inc();
+                Error::from(ErrorKind::DaemonBusy(format!(
+                    "all {} client RPC slots are in use, gave up waiting after {:?}",
+                    self.proxy_limit.capacity(),
+                    *DAEMON_PROXY_QUEUE_TIMEOUT
+                )))
+            })?;
+
+        match self.request_once(method, params, *DAEMON_PROXY_RPC_TIMEOUT) {
+            Ok(result) => {
+                self.proxy_rpc.with_label_values(&["ok"]).inc();
+                Ok(result)
+            }
+            Err(err) => {
+                // Report transport-level failures (which include hitting
+                // DAEMON_PROXY_RPC_TIMEOUT) distinctly from daemon-level rejections, so
+                // callers can answer "the daemon didn't respond" with a gateway error
+                // instead of blaming the client's request.
+                let unavailable = match err.kind() {
+                    ErrorKind::Connection(msg) => Some(format!("{} failed: {}", method, msg)),
+                    _ => None,
+                };
+                match unavailable {
+                    Some(msg) => {
+                        // The concise message is what the client sees, so log the full
+                        // chain (which carries the underlying io error) before dropping it.
+                        warn!("client daemon RPC failed: {}", err.display_chain());
+                        self.proxy_rpc.with_label_values(&["unavailable"]).inc();
+                        Err(ErrorKind::DaemonUnavailable(msg).into())
+                    }
+                    None => {
+                        self.proxy_rpc.with_label_values(&["error"]).inc();
+                        Err(err)
+                    }
+                }
+            }
+        }
+    }
+
+    #[trace]
+    fn retry_reconnect(&self) -> Daemon {
+        // XXX add a max reconnection attempts limit?
+        loop {
+            match self.reconnect() {
+                Ok(daemon) => break daemon,
+                Err(e) => {
+                    warn!("failed connecting to RPC daemon: {}", e.display_chain());
+                }
+            }
+        }
+    }
+
+    // Send requests in parallel over multiple RPC connections as individual JSON-RPC requests (with no JSON-RPC batching),
+    // buffering the replies into a vector. If any of the requests fail, processing is terminated and an Err is returned.
+    #[trace]
+    fn requests(&self, method: &str, params_list: Vec<Value>) -> Result<Vec<Value>> {
+        self.rpc_threads
+            .install(|| self.requests_iter(method, params_list).collect())
+    }
+
+    // Send requests in parallel over multiple RPC connections, iterating over the results without buffering them.
+    // Errors are included in the iterator and do not terminate other pending requests.
+    //
+    // IMPORTANT: The returned parallel iterator must be collected inside self.rpc_threads.install()
+    // to ensure it runs on the daemon's own thread pool, not the global rayon pool. This is necessary
+    // because the per-thread DAEMON_INSTANCE thread-locals would otherwise be shared across different
+    // daemon instances in the same process (e.g. during parallel tests).
+    #[trace]
+    fn requests_iter<'a>(
+        &'a self,
+        method: &'a str,
+        params_list: Vec<Value>,
+    ) -> impl ParallelIterator<Item = Result<Value>> + IndexedParallelIterator + 'a {
+        params_list.into_par_iter().map(move |params| {
+            // Store a local per-thread Daemon, each with its own TCP connection. These will
+            // get initialized as necessary for the `rpc_threads` pool thread managed by rayon.
+            thread_local!(static DAEMON_INSTANCE: OnceCell<Daemon> = OnceCell::new());
+
+            DAEMON_INSTANCE.with(|daemon| {
+                daemon
+                    .get_or_init(|| self.retry_reconnect())
+                    .retry_request(&method, &params)
+            })
+        })
     }
 
     // bitcoind JSONRPC API:
 
+    #[trace]
     pub fn getblockchaininfo(&self) -> Result<BlockchainInfo> {
         let info: Value = self.request("getblockchaininfo", json!([]))?;
         Ok(from_value(info).chain_err(|| "invalid blockchain info")?)
     }
 
+    #[trace]
     fn getnetworkinfo(&self) -> Result<NetworkInfo> {
         let info: Value = self.request("getnetworkinfo", json!([]))?;
         Ok(from_value(info).chain_err(|| "invalid network info")?)
     }
 
+    #[trace]
     pub fn getbestblockhash(&self) -> Result<BlockHash> {
         parse_hash(&self.request("getbestblockhash", json!([]))?)
     }
 
+    #[trace]
     pub fn getblockheader(&self, blockhash: &BlockHash) -> Result<BlockHeader> {
         header_from_value(self.request("getblockheader", json!([blockhash, /*verbose=*/ false]))?)
     }
 
+    #[trace]
     pub fn getblockheaders(&self, heights: &[usize]) -> Result<Vec<BlockHeader>> {
         let heights: Vec<Value> = heights.iter().map(|height| json!([height])).collect();
         let params_list: Vec<Value> = self
-            .requests("getblockhash", &heights)?
+            .requests("getblockhash", heights)?
             .into_iter()
             .map(|hash| json!([hash, /*verbose=*/ false]))
             .collect();
         let mut result = vec![];
-        for h in self.requests("getblockheader", &params_list)? {
+        for h in self.requests("getblockheader", params_list)? {
             result.push(header_from_value(h)?);
         }
         Ok(result)
     }
 
+    #[trace]
     pub fn getblock(&self, blockhash: &BlockHash) -> Result<Block> {
         let block =
             block_from_value(self.request("getblock", json!([blockhash, /*verbose=*/ false]))?)?;
@@ -490,16 +1286,41 @@ impl Daemon {
         Ok(block)
     }
 
+    #[trace]
     pub fn getblock_raw(&self, blockhash: &BlockHash, verbose: u32) -> Result<Value> {
         self.request("getblock", json!([blockhash, verbose]))
     }
 
+    #[trace]
     pub fn getblocks(&self, blockhashes: &[BlockHash]) -> Result<Vec<Block>> {
         let params_list: Vec<Value> = blockhashes
             .iter()
             .map(|hash| json!([hash, /*verbose=*/ false]))
             .collect();
-        let values = self.requests("getblock", &params_list)?;
+
+        let mut attempts = MAX_ATTEMPTS;
+        let values = loop {
+            attempts -= 1;
+
+            match self.requests("getblock", params_list.clone()) {
+                Ok(blocks) => break blocks,
+                Err(e) => {
+                    let err_msg = format!("{e:?}");
+                    if err_msg.contains("Block not found on disk")
+                        || err_msg.contains("Block not available")
+                    {
+                        // There is a small chance the node returns the header but didn't finish to index the block
+                        log::warn!("getblocks failing with: {e:?} trying {attempts} more time")
+                    } else {
+                        panic!("failed to get blocks from bitcoind: {}", err_msg);
+                    }
+                }
+            }
+            if attempts == 0 {
+                panic!("failed to get blocks from bitcoind")
+            }
+            std::thread::sleep(RETRY_WAIT_DURATION);
+        };
         let mut blocks = vec![];
         for value in values {
             blocks.push(block_from_value(value)?);
@@ -507,21 +1328,36 @@ impl Daemon {
         Ok(blocks)
     }
 
-    pub fn gettransactions(&self, txhashes: &[&Txid]) -> Result<Vec<Transaction>> {
-        let params_list: Vec<Value> = txhashes
+    /// Fetch the given transactions in parallel over multiple threads and RPC connections,
+    /// ignoring any missing ones and returning whatever is available.
+    #[trace]
+    pub fn gettransactions_available(&self, txids: &[&Txid]) -> Result<HashMap<Txid, Transaction>> {
+        const RPC_INVALID_ADDRESS_OR_KEY: i64 = -5;
+
+        let params_list: Vec<Value> = txids
             .iter()
             .map(|txhash| json!([txhash, /*verbose=*/ false]))
             .collect();
 
-        let values = self.requests("getrawtransaction", &params_list)?;
-        let mut txs = vec![];
-        for value in values {
-            txs.push(tx_from_value(value)?);
-        }
-        assert_eq!(txhashes.len(), txs.len());
-        Ok(txs)
+        self.rpc_threads.install(|| {
+            self.requests_iter("getrawtransaction", params_list)
+                .zip(txids)
+                .filter_map(|(res, txid)| match res {
+                    Ok(val) => Some(tx_from_value(val).map(|tx| (**txid, tx))),
+                    // Ignore 'tx not found' errors
+                    Err(Error(ErrorKind::RpcError(code, _, _), _))
+                        if code == RPC_INVALID_ADDRESS_OR_KEY =>
+                    {
+                        None
+                    }
+                    // Terminate iteration if any other errors are encountered
+                    Err(e) => Some(Err(e)),
+                })
+                .collect()
+        })
     }
 
+    #[trace]
     pub fn gettransaction_raw(
         &self,
         txid: &Txid,
@@ -531,36 +1367,89 @@ impl Daemon {
         self.request("getrawtransaction", json!([txid, verbose, blockhash]))
     }
 
+    #[trace]
     pub fn getmempooltx(&self, txhash: &Txid) -> Result<Transaction> {
         let value = self.request("getrawtransaction", json!([txhash, /*verbose=*/ false]))?;
         tx_from_value(value)
     }
 
+    #[trace]
     pub fn getmempooltxids(&self) -> Result<HashSet<Txid>> {
         let res = self.request("getrawmempool", json!([/*verbose=*/ false]))?;
         Ok(serde_json::from_value(res).chain_err(|| "invalid getrawmempool reply")?)
     }
 
+    #[cfg(not(feature = "liquid"))]
+    #[trace]
+    pub fn getblocktemplate(&self, rules: &[&str]) -> Result<Value> {
+        self.request_once(
+            "getblocktemplate",
+            json!([{ "rules": rules }]),
+            BLOCK_TEMPLATE_RPC_TIMEOUT,
+        )
+    }
+
+    #[cfg(feature = "liquid")]
+    #[trace]
+    pub fn getnewblockhex(&self) -> Result<String> {
+        let value = self.request_once("getnewblockhex", json!([]), BLOCK_TEMPLATE_RPC_TIMEOUT)?;
+        value
+            .as_str()
+            .map(str::to_owned)
+            .chain_err(|| "non-string getnewblockhex response")
+    }
+
+    #[trace]
     pub fn broadcast(&self, tx: &Transaction) -> Result<Txid> {
         self.broadcast_raw(&serialize_hex(tx))
     }
 
+    /// Broadcast a raw transaction on behalf of an API client.
+    ///
+    /// Uses the bounded client RPC path (`request_proxied`) rather than the shared
+    /// singleton connection: this is reachable anonymously over both the REST and Electrum
+    /// interfaces, so it must not be able to stall the indexer or other clients.
+    #[trace]
     pub fn broadcast_raw(&self, txhex: &str) -> Result<Txid> {
-        let txid = self.request("sendrawtransaction", json!([txhex]))?;
+        let txid = self.request_proxied("sendrawtransaction", json!([txhex]))?;
         Ok(
             Txid::from_str(txid.as_str().chain_err(|| "non-string txid")?)
                 .chain_err(|| "failed to parse txid")?,
         )
     }
 
+    pub fn submit_package(
+        &self,
+        txhex: Vec<String>,
+        maxfeerate: Option<f64>,
+        maxburnamount: Option<f64>,
+    ) -> Result<SubmitPackageResult> {
+        let params = match (maxfeerate, maxburnamount) {
+            (Some(rate), Some(burn)) => {
+                json!([txhex, format!("{:.8}", rate), format!("{:.8}", burn)])
+            }
+            (Some(rate), None) => json!([txhex, format!("{:.8}", rate)]),
+            (None, Some(burn)) => json!([txhex, null, format!("{:.8}", burn)]),
+            (None, None) => json!([txhex]),
+        };
+        // Anonymously reachable, so bounded like broadcast_raw() above.
+        let result = self.request_proxied("submitpackage", params)?;
+        serde_json::from_value::<SubmitPackageResult>(result)
+            .chain_err(|| "invalid submitpackage reply")
+    }
+
     // Get estimated feerates for the provided confirmation targets using a batch RPC request
     // Missing estimates are logged but do not cause a failure, whatever is available is returned
     #[allow(clippy::float_cmp)]
+    #[trace]
     pub fn estimatesmartfee_batch(&self, conf_targets: &[u16]) -> Result<HashMap<u16, f64>> {
-        let params_list: Vec<Value> = conf_targets.iter().map(|t| json!([t, "ECONOMICAL"])).collect();
+        let params_list: Vec<Value> = conf_targets
+            .iter()
+            .map(|t| json!([t, "ECONOMICAL"]))
+            .collect();
 
         Ok(self
-            .requests("estimatesmartfee", &params_list)?
+            .requests("estimatesmartfee", params_list)?
             .iter()
             .zip(conf_targets)
             .filter_map(|(reply, target)| {
@@ -587,6 +1476,7 @@ impl Daemon {
             .collect())
     }
 
+    #[trace]
     fn get_all_headers(&self, tip: &BlockHash) -> Result<Vec<BlockHeader>> {
         let info: Value = self.request("getblockheader", json!([tip]))?;
         let tip_height = info
@@ -598,10 +1488,17 @@ impl Daemon {
         let chunk_size = 100_000;
         let mut result = vec![];
         for heights in all_heights.chunks(chunk_size) {
-            trace!("downloading {} block headers", heights.len());
             let mut headers = self.getblockheaders(&heights)?;
             assert!(headers.len() == heights.len());
+
             result.append(&mut headers);
+
+            debug!(
+                "downloaded {}/{} block headers ({:.0}%)",
+                result.len(),
+                tip_height + 1,
+                result.len() as f32 / (tip_height + 1) as f32 * 100.0
+            );
         }
 
         let mut blockhash = *DEFAULT_BLOCKHASH;
@@ -614,6 +1511,7 @@ impl Daemon {
     }
 
     // Returns a list of BlockHeaders in ascending height (i.e. the tip is last).
+    #[trace]
     pub fn get_new_headers(
         &self,
         indexed_headers: &HeaderList,
@@ -621,7 +1519,7 @@ impl Daemon {
     ) -> Result<Vec<BlockHeader>> {
         // Iterate back over headers until known blockash is found:
         if indexed_headers.is_empty() {
-            debug!("downloading all block headers up to {}", bestblockhash);
+            info!("downloading all block headers up to {}", bestblockhash);
             return self.get_all_headers(bestblockhash);
         }
         debug!(
@@ -646,10 +1544,455 @@ impl Daemon {
         Ok(new_headers)
     }
 
+    #[trace]
     pub fn get_relayfee(&self) -> Result<f64> {
         let relayfee = self.getnetworkinfo()?.relayfee;
 
         // from BTC/kB to sat/b
         Ok(relayfee * 100_000f64)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        parse_jsonrpc_reply, recycle_due, BlockingSemaphore, Connection, ConnectionConfig,
+        CookieGetter, DAEMON_MAX_BODY_BYTES, DAEMON_MAX_HEADER_LINE_BYTES,
+    };
+    use crate::errors::{Error, ErrorKind, Result};
+    use crate::signal::Waiter;
+    use serde_json::json;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    const COOLDOWN: Duration = Duration::from_secs(30);
+    const MAX_AGE: Option<Duration> = Some(Duration::from_secs(60));
+
+    fn secs(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
+
+    fn millis(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    /// Spawn a fake daemon that runs `respond` against the accepted socket, and hand back a
+    /// one-shot `Connection` pointed at it. The connection's I/O timeout doubles as its
+    /// whole-request `recv` budget, so `io_timeout` is what the deadline tests turn on.
+    fn fake_daemon<F>(io_timeout: Duration, respond: F) -> (Connection, thread::JoinHandle<()>)
+    where
+        F: FnOnce(TcpStream) + Send + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            respond(socket);
+        });
+
+        let config = ConnectionConfig {
+            addr,
+            fallback: None,
+            cookie_getter: Arc::new(StaticCookie),
+            signal: Waiter::start(crossbeam_channel::never()),
+            max_age: None,
+        };
+
+        (config.connect_once(io_timeout).unwrap(), server)
+    }
+
+    /// Go silent until the client hangs up, so the responder thread joins promptly instead
+    /// of the test paying for a fixed sleep.
+    fn wait_for_close(mut socket: TcpStream) {
+        let mut sink = [0u8; 1];
+        while matches!(socket.read(&mut sink), Ok(n) if n > 0) {}
+    }
+
+    fn connection_error(err: &Error) -> String {
+        match err.kind() {
+            ErrorKind::Connection(msg) => msg.clone(),
+            other => panic!("expected a connection error, got {:?}", other),
+        }
+    }
+
+    struct StaticCookie;
+
+    impl CookieGetter for StaticCookie {
+        fn get(&self) -> Result<Vec<u8>> {
+            Ok(b"user:password".to_vec())
+        }
+    }
+
+    #[test]
+    fn one_shot_connection_uses_endpoint_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let config = ConnectionConfig {
+            addr: listener.local_addr().unwrap(),
+            fallback: None,
+            cookie_getter: Arc::new(StaticCookie),
+            signal: Waiter::start(crossbeam_channel::never()),
+            max_age: None,
+        };
+
+        let connection = config.connect_once(secs(2)).unwrap();
+        assert_eq!(connection.tx.read_timeout().unwrap(), Some(secs(2)));
+        assert_eq!(connection.tx.write_timeout().unwrap(), Some(secs(2)));
+    }
+
+    #[test]
+    fn no_max_age_never_recycles() {
+        // Unlimited (the default): never recycle, regardless of age.
+        assert!(!recycle_due(secs(10_000), None, None, COOLDOWN));
+    }
+
+    #[test]
+    fn younger_than_max_age_does_not_recycle() {
+        assert!(!recycle_due(secs(5), MAX_AGE, None, COOLDOWN));
+    }
+
+    #[test]
+    fn expired_with_no_prior_attempt_recycles() {
+        assert!(recycle_due(secs(61), MAX_AGE, None, COOLDOWN));
+    }
+
+    #[test]
+    fn expired_within_cooldown_waits() {
+        // A recent failed attempt should suppress retries until the cooldown elapses,
+        // even though the connection is well past its max age.
+        assert!(!recycle_due(secs(600), MAX_AGE, Some(secs(5)), COOLDOWN));
+    }
+
+    #[test]
+    fn expired_after_cooldown_retries() {
+        assert!(recycle_due(secs(600), MAX_AGE, Some(secs(31)), COOLDOWN));
+    }
+
+    #[test]
+    fn one_shot_connection_recv_gives_up_at_the_endpoint_timeout() {
+        // A daemon that accepts the connection and then never answers is exactly the
+        // failure mode behind XF-05: without a short client-facing timeout the caller
+        // blocks for DAEMON_READ_TIMEOUT (10 minutes by default). Hold the accepted socket
+        // open for the duration so the read blocks rather than seeing EOF.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let blackhole = thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            thread::sleep(secs(5));
+            drop(socket);
+        });
+
+        let config = ConnectionConfig {
+            addr,
+            fallback: None,
+            cookie_getter: Arc::new(StaticCookie),
+            signal: Waiter::start(crossbeam_channel::never()),
+            max_age: None,
+        };
+
+        let mut connection = config.connect_once(secs(1)).unwrap();
+        connection
+            .send(&json!({"method": "getblockcount"}).to_string())
+            .unwrap();
+
+        let started = Instant::now();
+        let err = connection.recv().unwrap_err();
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(err.kind(), ErrorKind::Connection(_)),
+            "expected a connection error, got {:?}",
+            err
+        );
+        assert!(
+            elapsed >= secs(1) && elapsed < secs(4),
+            "recv should give up at the endpoint timeout, took {:?}",
+            elapsed
+        );
+
+        blackhole.join().unwrap();
+    }
+
+    #[test]
+    fn recv_reads_a_well_formed_response() {
+        // Control for the rest of this group. Note the trailing EOL, which Content-Length
+        // covers but the JSON payload does not include.
+        let body = json!({"result": 42, "error": null, "id": 1}).to_string();
+        let payload = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}\n",
+            body.len() + 1,
+            body
+        );
+
+        let (mut connection, server) = fake_daemon(secs(5), move |mut socket| {
+            socket.write_all(payload.as_bytes()).unwrap();
+            thread::sleep(millis(200));
+        });
+
+        assert_eq!(connection.recv().unwrap(), body);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn recv_rejects_an_endless_header_stream() {
+        let (mut connection, server) = fake_daemon(secs(10), |mut socket| {
+            let _ = socket.write_all(b"HTTP/1.1 200 OK\r\n");
+            while socket
+                .write_all(b"X-Filler: aaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n")
+                .is_ok()
+            {}
+        });
+
+        let err = connection.recv().unwrap_err();
+        let msg = connection_error(&err);
+        assert!(
+            msg.contains("too many response headers") || msg.contains("headers exceed cap"),
+            "expected a header cap error, got {:?}",
+            msg
+        );
+
+        drop(connection);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn recv_rejects_an_oversized_header_line() {
+        // The per-line budget is checked before the buffer grows, so one enormous header is
+        // refused rather than allocated.
+        let oversized = *DAEMON_MAX_HEADER_LINE_BYTES + 1;
+        let (mut connection, server) = fake_daemon(secs(10), move |mut socket| {
+            let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nX-Filler: ");
+            let chunk = vec![b'a'; 1024];
+            let mut sent = 0;
+            while sent < oversized && socket.write_all(&chunk).is_ok() {
+                sent += chunk.len();
+            }
+        });
+
+        let err = connection.recv().unwrap_err();
+        let msg = connection_error(&err);
+        assert!(
+            msg.contains("line exceeds cap"),
+            "expected a line cap error, got {:?}",
+            msg
+        );
+
+        drop(connection);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn recv_rejects_a_body_larger_than_the_cap() {
+        // The declared length is refused before a single body byte is read.
+        let payload = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+            *DAEMON_MAX_BODY_BYTES + 1
+        );
+        let (mut connection, server) = fake_daemon(secs(5), move |mut socket| {
+            let _ = socket.write_all(payload.as_bytes());
+            thread::sleep(millis(200));
+        });
+
+        let err = connection.recv().unwrap_err();
+        let msg = connection_error(&err);
+        assert!(
+            msg.contains("body exceeds cap"),
+            "expected a body cap error, got {:?}",
+            msg
+        );
+
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn recv_rejects_a_zero_content_length() {
+        // `Content-Length: 0` used to underflow `contents_length - 1`.
+        let (mut connection, server) = fake_daemon(secs(5), |mut socket| {
+            let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+            thread::sleep(millis(200));
+        });
+
+        let err = connection.recv().unwrap_err();
+        let msg = connection_error(&err);
+        assert!(
+            msg.contains("content_length='0'"),
+            "expected an empty body error, got {:?}",
+            msg
+        );
+
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn recv_gives_up_on_a_drip_feeding_daemon() {
+        // A peer that sends something before each per-syscall timeout elapses never trips it,
+        // so only the whole-request deadline releases the worker.
+        let (mut connection, server) = fake_daemon(secs(1), |mut socket| {
+            let _ = socket.write_all(b"HTTP/1.1 200 OK\r\n");
+            for _ in 0..200 {
+                if socket.write_all(b"X").is_err() || socket.flush().is_err() {
+                    return;
+                }
+                thread::sleep(millis(100));
+            }
+        });
+
+        let started = Instant::now();
+        let err = connection.recv().unwrap_err();
+        let elapsed = started.elapsed();
+
+        let msg = connection_error(&err);
+        assert!(
+            msg.contains("deadline exceeded"),
+            "expected a deadline error, got {:?}",
+            msg
+        );
+        assert!(
+            elapsed >= secs(1) && elapsed < millis(1500),
+            "recv should give up at the request deadline, took {:?}",
+            elapsed
+        );
+
+        drop(connection);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn recv_deadline_is_not_extended_by_a_write_just_before_it_expires() {
+        // A byte arriving at 900ms used to pass the between-reads deadline check and then
+        // block for another whole socket timeout, so a 1s budget bought the peer nearly 2s.
+        let (mut connection, server) = fake_daemon(secs(1), |mut socket| {
+            let _ = socket.write_all(b"HTTP/1.1 200 OK\r\n");
+            let _ = socket.flush();
+            thread::sleep(millis(900));
+            let _ = socket.write_all(b"X");
+            let _ = socket.flush();
+            wait_for_close(socket);
+        });
+
+        let started = Instant::now();
+        let err = connection.recv().unwrap_err();
+        let elapsed = started.elapsed();
+
+        let msg = connection_error(&err);
+        assert!(
+            msg.contains("deadline exceeded"),
+            "expected a deadline error, got {:?}",
+            msg
+        );
+        assert!(
+            elapsed < millis(1500),
+            "recv should stop at the 1s budget rather than extend it, took {:?}",
+            elapsed
+        );
+
+        drop(connection);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn recv_body_deadline_is_not_extended_by_a_write_just_before_it_expires() {
+        // Same as above for the body read, which is the one that handles multi-MB replies.
+        let (mut connection, server) = fake_daemon(secs(1), |mut socket| {
+            let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1024\r\n\r\n");
+            let _ = socket.flush();
+            thread::sleep(millis(900));
+            let _ = socket.write_all(b"X");
+            let _ = socket.flush();
+            wait_for_close(socket);
+        });
+
+        let started = Instant::now();
+        let err = connection.recv().unwrap_err();
+        let elapsed = started.elapsed();
+
+        let msg = connection_error(&err);
+        assert!(
+            msg.contains("deadline exceeded"),
+            "expected a deadline error, got {:?}",
+            msg
+        );
+        assert!(
+            elapsed < millis(1500),
+            "recv should stop at the 1s budget rather than extend it, took {:?}",
+            elapsed
+        );
+
+        drop(connection);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn semaphore_hands_out_capacity_permits() {
+        let semaphore = BlockingSemaphore::new(2);
+        let first = semaphore.acquire(secs(0));
+        let second = semaphore.acquire(secs(0));
+        assert!(first.is_some());
+        assert!(second.is_some());
+        // At capacity: the third caller is refused rather than queued indefinitely.
+        assert!(semaphore.acquire(secs(0)).is_none());
+    }
+
+    #[test]
+    fn semaphore_permit_is_returned_on_drop() {
+        let semaphore = BlockingSemaphore::new(1);
+        {
+            let _permit = semaphore.acquire(secs(0)).unwrap();
+            assert!(semaphore.acquire(secs(0)).is_none());
+        }
+        assert!(semaphore.acquire(secs(0)).is_some());
+    }
+
+    #[test]
+    fn semaphore_zero_capacity_is_treated_as_one() {
+        // A zero cap would wedge every client request, so it is clamped rather than honored.
+        let semaphore = BlockingSemaphore::new(0);
+        assert_eq!(semaphore.capacity(), 1);
+        assert!(semaphore.acquire(secs(0)).is_some());
+    }
+
+    #[test]
+    fn semaphore_gives_up_after_wait_timeout() {
+        let semaphore = BlockingSemaphore::new(1);
+        let _permit = semaphore.acquire(secs(0)).unwrap();
+
+        // This is what stops client requests from piling up behind a wedged daemon: the
+        // caller waits a bounded time and is then refused.
+        let started = Instant::now();
+        assert!(semaphore.acquire(Duration::from_millis(150)).is_none());
+        assert!(started.elapsed() >= Duration::from_millis(150));
+    }
+
+    #[test]
+    fn semaphore_wakes_a_waiter_when_a_permit_is_released() {
+        let semaphore = Arc::new(BlockingSemaphore::new(1));
+        let permit = semaphore.acquire(secs(0)).unwrap();
+
+        let waiter = {
+            let semaphore = Arc::clone(&semaphore);
+            thread::spawn(move || semaphore.acquire(secs(5)).is_some())
+        };
+
+        thread::sleep(Duration::from_millis(50));
+        drop(permit);
+        assert!(waiter.join().unwrap());
+    }
+
+    #[test]
+    fn warmup_error_parses_as_rpc_error() {
+        let reply = json!({
+            "result": null,
+            "error": { "code": -28, "message": "warming up" },
+            "id": 1
+        });
+        match parse_jsonrpc_reply(reply, "getblocktemplate", 1) {
+            Err(Error(ErrorKind::RpcError(-28, message, method), _)) => {
+                assert_eq!(message, "warming up");
+                assert_eq!(method, "getblocktemplate");
+            }
+            other => panic!("unexpected getblocktemplate warmup result: {:?}", other),
+        }
     }
 }

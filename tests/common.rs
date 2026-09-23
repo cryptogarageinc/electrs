@@ -11,15 +11,16 @@ use serde_json::json;
 use serde_json::Value;
 
 #[cfg(not(feature = "liquid"))]
-use bitcoind::{self as noded, BitcoinD as NodeD};
+use corepc_node::{self as noded, client::client_sync as nclient, Client, Node as NodeD};
 #[cfg(feature = "liquid")]
-use elementsd::{self as noded, ElementsD as NodeD};
+use elementsd::{self as noded, bitcoincore_rpc as nclient, ElementsD as NodeD};
 
-use noded::bitcoincore_rpc::{self, RpcApi};
+#[cfg(feature = "liquid")]
+use nclient::{Client, RpcApi};
 
 use electrs::{
     chain::{Address, BlockHash, Network, Txid},
-    config::Config,
+    config::{Config, RpcLogging},
     daemon::Daemon,
     electrum::RPC as ElectrumRPC,
     json_logger::JsonLogger,
@@ -39,6 +40,7 @@ pub struct TestRunner {
     daemon: Arc<Daemon>,
     mempool: Arc<RwLock<Mempool>>,
     metrics: Metrics,
+    salt_rwlock: Arc<RwLock<String>>,
 }
 
 impl TestRunner {
@@ -93,10 +95,15 @@ impl TestRunner {
             network_type,
             db_path: electrsdb.path().to_path_buf(),
             daemon_dir: daemon_subdir.clone(),
+            daemon_parallelism: 3,
+            daemon_conn_max_age: None,
             blocks_dir: daemon_subdir.join("blocks"),
             daemon_rpc_addr: params.rpc_socket.into(),
+            daemon_rpc_fallback_addr: None,
             cookie: None,
             electrum_rpc_addr: rand_available_addr(),
+            electrum_rpc_conn_max_age: None,
+            electrum_rpc_max_request_num_bytes: 1_048_576,
             http_addr: rand_available_addr(),
             http_socket_file: None, // XXX test with socket file or tcp?
             monitoring_addr: rand_available_addr(),
@@ -106,18 +113,26 @@ impl TestRunner {
             address_search: true,
             index_unspendables: false,
             ignore_check_initialblockdownload: false,
+            enable_mining_rest: true,
             cors: None,
             precache_scripts: None,
             utxos_limit: 100,
             electrum_txs_limit: 100,
+            electrum_subscription_limit: 10_000,
+            electrum_checkpoint_proof_concurrency_limit: 2,
             electrum_banner: "".into(),
-            electrum_rpc_logging: None,
+            rpc_logging: RpcLogging::default(),
+            zmq_addr: None,
 
             #[cfg(feature = "liquid")]
             asset_db_path: None, // XXX
             #[cfg(feature = "liquid")]
             parent_network: bitcoin::Network::Regtest,
-            initial_sync_compaction: false,
+            db_block_cache_mb: 8,
+            db_parallelism: 2,
+            db_write_buffer_size_mb: 256,
+            initial_sync_batch_size: 250,
+            db_cache_index_filter_blocks: false,
             //#[cfg(feature = "electrum-discovery")]
             //electrum_public_hosts: Option<crate::electrum::ServerHosts>,
             //#[cfg(feature = "electrum-discovery")]
@@ -126,7 +141,7 @@ impl TestRunner {
             //tor_proxy: Option<std::net::SocketAddr>,
         });
 
-        let signal = Waiter::start();
+        let signal = Waiter::start(crossbeam_channel::never());
         let metrics = Metrics::new(rand_available_addr());
         metrics.start();
 
@@ -134,14 +149,17 @@ impl TestRunner {
             &config.daemon_dir,
             &config.blocks_dir,
             config.daemon_rpc_addr,
+            config.daemon_rpc_fallback_addr,
+            config.daemon_parallelism,
             config.cookie_getter(),
             config.network_type,
             signal.clone(),
             &metrics,
             config.ignore_check_initialblockdownload,
+            config.daemon_conn_max_age,
         )?);
 
-        let store = Arc::new(Store::open(&config.db_path.join("newindex"), &config));
+        let store = Arc::new(Store::open(&config, &metrics, true));
 
         let fetch_from = if !env::var("JSONRPC_IMPORT").is_ok() && !cfg!(feature = "liquid") {
             // run the initial indexing from the blk files then switch to using the jsonrpc,
@@ -155,7 +173,7 @@ impl TestRunner {
         };
 
         let mut indexer = Indexer::open(Arc::clone(&store), fetch_from, &config, &metrics);
-        indexer.update(&daemon)?;
+        let tip = indexer.update(&daemon)?;
         indexer.fetch_from(FetchFrom::Bitcoind);
 
         let chain = Arc::new(ChainQuery::new(
@@ -170,7 +188,7 @@ impl TestRunner {
             &metrics,
             Arc::clone(&config),
         )));
-        Mempool::update(&mempool, &daemon)?;
+        assert!(Mempool::update(&mempool, &daemon, &tip)?);
 
         let query = Arc::new(Query::new(
             Arc::clone(&chain),
@@ -181,6 +199,8 @@ impl TestRunner {
             None, // TODO
         ));
 
+        let salt_rwlock = Arc::new(RwLock::new(String::from("foobar")));
+
         Ok(TestRunner {
             config,
             node,
@@ -190,10 +210,11 @@ impl TestRunner {
             daemon,
             mempool,
             metrics,
+            salt_rwlock,
         })
     }
 
-    pub fn node_client(&self) -> &bitcoincore_rpc::Client {
+    pub fn node_client(&self) -> &Client {
         #[cfg(not(feature = "liquid"))]
         return &self.node.client;
         #[cfg(feature = "liquid")]
@@ -201,8 +222,8 @@ impl TestRunner {
     }
 
     pub fn sync(&mut self) -> Result<()> {
-        self.indexer.update(&self.daemon)?;
-        Mempool::update(&self.mempool, &self.daemon)?;
+        let tip = self.indexer.update(&self.daemon)?;
+        assert!(Mempool::update(&self.mempool, &self.daemon, &tip)?);
         // force an update for the mempool stats, which are normally cached
         self.mempool.write().unwrap().update_backlog_stats();
         Ok(())
@@ -268,46 +289,95 @@ impl TestRunner {
         let uc_addr = serde_json::from_value(info["unconfidential"].take())?;
         Ok((c_addr, uc_addr))
     }
+
+    // Utility functions to iron out some differences between `elementsd` which
+    // internally uses `bitcoincore-rpc` and `corepc-node` which uses `corerpc-client`
+
+    pub fn get_best_block_hash(&self) -> Result<BlockHash> {
+        let bestblockhash = self.node_client().get_best_block_hash()?;
+        #[cfg(not(feature = "liquid"))] // from corepc_types::GetBestBlockHash to bitcoin::BlockHash
+        let bestblockhash = bestblockhash.0.parse().unwrap();
+        #[cfg(feature = "liquid")] // from bitcoin::BlockHash to elements::BlockHash
+        let bestblockhash = BlockHash::from_raw_hash(bestblockhash.to_raw_hash());
+        Ok(bestblockhash)
+    }
+
+    pub fn get_block_count(&self) -> Result<u64> {
+        let blockcount = self.node_client().get_block_count()?;
+        #[cfg(not(feature = "liquid"))]
+        let blockcount = blockcount.0;
+        Ok(blockcount)
+    }
+
+    pub fn get_block_hash(&self, height: u64) -> Result<BlockHash> {
+        let blockhash = self.node_client().get_block_hash(height)?;
+        #[cfg(not(feature = "liquid"))] // from corepc_types::GetBlockHash to bitcoin::BlockHash
+        let blockhash = blockhash.block_hash().unwrap();
+        #[cfg(feature = "liquid")] // from bitcoin::BlockHash to elements::BlockHash
+        let blockhash = BlockHash::from_raw_hash(blockhash.to_raw_hash());
+        Ok(blockhash)
+    }
+
+    // currently not used in liquid mode
+
+    #[cfg(not(feature = "liquid"))]
+    pub fn get_raw_transaction(&self, txid: Txid) -> Result<bitcoin::Transaction> {
+        Ok(self
+            .node_client()
+            .get_raw_transaction(txid)?
+            .transaction()
+            .unwrap())
+    }
 }
 
 pub fn init_rest_tester() -> Result<(rest::Handle, net::SocketAddr, TestRunner)> {
     let tester = TestRunner::new()?;
+    let addr = tester.config.http_addr;
     let rest_server = rest::start(Arc::clone(&tester.config), Arc::clone(&tester.query));
-    log::info!("REST server running on {}", tester.config.http_addr);
-    Ok((rest_server, tester.config.http_addr, tester))
+    wait_for_tcp(addr, "REST");
+    Ok((rest_server, addr, tester))
 }
 pub fn init_electrum_tester() -> Result<(ElectrumRPC, net::SocketAddr, TestRunner)> {
     let tester = TestRunner::new()?;
+    let addr = tester.config.electrum_rpc_addr;
     let electrum_server = ElectrumRPC::start(
         Arc::clone(&tester.config),
         Arc::clone(&tester.query),
         &tester.metrics,
+        Arc::clone(&tester.salt_rwlock),
     );
-    log::info!(
-        "Electrum server running on {}",
-        tester.config.electrum_rpc_addr
-    );
-    Ok((electrum_server, tester.config.electrum_rpc_addr, tester))
+    wait_for_tcp(addr, "Electrum");
+    Ok((electrum_server, addr, tester))
+}
+
+fn wait_for_tcp(addr: net::SocketAddr, name: &str) {
+    for _ in 0..50 {
+        if net::TcpStream::connect(addr).is_ok() {
+            log::info!("{} server running on {}", name, addr);
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    panic!("{} server failed to start on {}", name, addr);
 }
 
 #[cfg(not(feature = "liquid"))]
-fn raw_new_address(
-    client: &bitcoincore_rpc::Client,
-) -> bitcoincore_rpc::Result<Address<bitcoin::address::NetworkChecked>> {
-    Ok(client.get_new_address(None, None)?.assume_checked())
+fn raw_new_address(client: &Client) -> nclient::Result<Address<bitcoin::address::NetworkChecked>> {
+    Ok(client
+        .get_new_address(None, None)?
+        .address()
+        .unwrap()
+        .assume_checked())
 }
 
 // Returns the confidential address
 #[cfg(feature = "liquid")]
-fn raw_new_address(client: &bitcoincore_rpc::Client) -> bitcoincore_rpc::Result<Address> {
+fn raw_new_address(client: &Client) -> nclient::Result<Address> {
     // Must use raw call() because get_new_address() returns a bitcoin::Address and not an elements::Address
     Ok(client.call::<Address>("getnewaddress", &[])?)
 }
 
-fn generate(
-    client: &bitcoincore_rpc::Client,
-    num_blocks: u32,
-) -> bitcoincore_rpc::Result<Vec<BlockHash>> {
+fn generate(client: &Client, num_blocks: u32) -> nclient::Result<Vec<BlockHash>> {
     let addr = raw_new_address(client)?;
     client.call(
         "generatetoaddress",
@@ -329,9 +399,21 @@ fn init_log() -> StdErrLog {
 }
 
 fn rand_available_addr() -> net::SocketAddr {
-    // note this has a potential but unlikely race condition, if the port is grabbed before the caller binds it
-    let socket = net::UdpSocket::bind("127.0.0.1:0").unwrap();
-    socket.local_addr().unwrap()
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+
+    lazy_static::lazy_static! {
+        static ref USED_PORTS: Mutex<HashSet<u16>> = Mutex::new(HashSet::new());
+    }
+
+    loop {
+        let mut used = USED_PORTS.lock().unwrap();
+        let socket = net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = socket.local_addr().unwrap();
+        if used.insert(addr.port()) {
+            return addr;
+        }
+    }
 }
 
 error_chain::error_chain! {
@@ -345,7 +427,7 @@ error_chain::error_chain! {
             display("Electrs error: {:?}", e)
         }
 
-        BitcoindRpc(e: bitcoind::bitcoincore_rpc::Error) {
+        BitcoindRpc(e: nclient::Error) {
             description("Bitcoind RPC error")
             display("Bitcoind RPC error: {:?}", e)
         }
@@ -375,8 +457,8 @@ impl From<electrs::errors::Error> for Error {
         Error::from(ErrorKind::Electrs(e))
     }
 }
-impl From<bitcoind::bitcoincore_rpc::Error> for Error {
-    fn from(e: bitcoind::bitcoincore_rpc::Error) -> Self {
+impl From<nclient::Error> for Error {
+    fn from(e: nclient::Error) -> Self {
         Error::from(ErrorKind::BitcoindRpc(e))
     }
 }

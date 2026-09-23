@@ -10,15 +10,15 @@ Documentation for the database schema and indexing process [is available here](d
 
 ### Installing & indexing
 
-Install Rust, Bitcoin Core (no `txindex` needed) and the `clang` and `cmake` packages, then:
+Install Rust, Bitcoin Core (no `txindex` needed) and the `clang` and `cmake` packages, increase maximum number open files by `ulimit -n 100000` and then:
 
 ```bash
 $ git clone https://github.com/blockstream/electrs && cd electrs
 $ git checkout new-index
-$ cargo run --release --bin electrs -- -vvvv --daemon-dir ~/.bitcoin
+$ cargo run --release --bin electrs -- --daemon-dir ~/.bitcoin
 
 # Or for liquid:
-$ cargo run --features liquid --release --bin electrs -- -vvvv --network liquid --daemon-dir ~/.liquid
+$ cargo run --features liquid --release --bin electrs -- --network liquid --daemon-dir ~/.liquid
 ```
 
 See [electrs's original documentation](https://github.com/romanz/electrs/blob/master/doc/usage.md) for more detailed instructions.
@@ -67,6 +67,7 @@ In addition to electrs's original configuration options, a few new options are a
 - `--cors <origins>` - origins allowed to make cross-site request (optional, defaults to none).
 - `--address-search` - enables the by-prefix address search index.
 - `--index-unspendables` - enables indexing of provably unspendable outputs.
+- `--enable-mining-rest` - enables cached mining-related HTTP endpoints.
 - `--utxos-limit <num>` - maximum number of utxos to return per address.
 - `--electrum-txs-limit <num>` - maximum number of txs to return per address in the electrum server (does not apply for the http api).
 - `--electrum-banner <text>` - welcome banner text for electrum server.
@@ -75,10 +76,39 @@ Additional options with the `liquid` feature:
 - `--parent-network <network>` - the parent network this chain is pegged to.
 
 Additional options with the `electrum-discovery` feature:
-- `--electrum-hosts <json>` - a json map of the public hosts where the electrum server is reachable, in the [`server.features` format](https://electrumx.readthedocs.io/en/latest/protocol-methods.html#server.features).
+- `--electrum-hosts <json>` - a json map of the public hosts where the electrum server is reachable, in the [`server.features` format](https://electrum-protocol.readthedocs.io/en/latest/protocol-methods.html#server-features).
 - `--electrum-announce` - announce the electrum server on the electrum p2p server discovery network.
 
 See `$ cargo run --release --bin electrs -- --help` for the full list of options.
+
+### Mining-related HTTP endpoints
+
+`GET /block-template` is available only with `--enable-mining-rest`. It proxies
+the daemon's `getblocktemplate` response unchanged on Bitcoin-compatible chains.
+On Liquid, it instead decodes the complete proposal returned by
+`getnewblockhex` and projects the recoverable header, transaction, fee,
+coinbase, and witness-commitment data into the same response shape. Fields that
+have no equivalent mining semantics for signed dynafed blocks use compatibility
+defaults or are omitted. The Liquid response is intended for template inspection
+and distribution, not block reconstruction or federation signing.
+
+Successful responses are cached for 15 seconds and invalidated early when
+electrs indexes a new tip. Cache misses are coalesced into one daemon request.
+Responses use `Cache-Control: no-store`, so downstream caches do not extend the
+internal lifetime.
+
+Template RPCs use an isolated daemon connection with a 30-second I/O timeout.
+Failures are retained internally for one second to prevent HTTP pollers from
+immediately repeating the same failing RPC, while error responses remain
+`Cache-Control: no-store`. Malformed Bitcoin templates that cannot be validated
+against the indexed tip are rejected with `502 Bad Gateway`; they are not served
+or cached.
+
+All connections to the configured daemon RPC endpoint are expected to expose a
+coherent chain view. Deployments using an L4 load balancer must keep its daemon
+backends synchronized or provide backend affinity. A template that conflicts
+with electrs' indexed tip is rejected rather than serving potentially stale
+mining work.
 
 ## License
 
